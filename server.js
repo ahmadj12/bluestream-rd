@@ -69,30 +69,87 @@ async function getTMDBMeta(id, type) {
 }
 
 // ====== TorrentDownloads.pro - Scraper ======
+// ====== TorrentDownloads.pro - بحث متقدم ======
 async function searchTorrentDownloads(query) {
+  const allResults = [];
+  const seen = new Set();
+  
+  // جرب عدة صيغ بحث
+  const queries = [
+    query,
+    query.replace(/:/g, ''), // بدون :
+    query.replace(/'/g, ''), // بدون '
+  ];
+  
+  for (const q of queries) {
+    try {
+      const targetUrl = `https://www.torrentdownloads.pro/search/?search=${encodeURIComponent(q)}`;
+      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+      
+      const response = await fetchURL(proxyUrl);
+      if (response.status !== 200 || !response.data?.contents) continue;
+      
+      const html = response.data.contents;
+      
+      // البحث عن روابط الـ torrents
+      const torrentRegex = /<a\s+href="(\/torrent\/\d+\/[^"]+)"[^>]*>([^<]+)<\/a>/g;
+      let match;
+      while ((match = torrentRegex.exec(html)) !== null) {
+        const torrentName = match[2].trim();
+        const lower = torrentName.toLowerCase();
+        
+        // فلترة المحتوى الغير مرغوب
+        if (lower.includes('.mp3') || lower.includes('soundtrack')) continue;
+        if (lower.includes('kms') || lower.includes('activator')) continue;
+        if (lower.includes('crack') || lower.includes('patch')) continue;
+        if (lower.includes('game ') || lower.includes('android')) continue;
+        
+        // تجنب التكرار
+        const key = torrentName.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 30);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        
+        allResults.push({
+          name: torrentName,
+          url_path: match[1],
+          quality: lower.includes('1080p') ? '1080p' : 
+                  lower.includes('720p') ? '720p' : 
+                  lower.includes('2160p') || lower.includes('4k') ? '4K' : '480p',
+          size: 0,
+          source: 'torrentdownloads',
+          magnet: null,
+        });
+      }
+    } catch (err) {
+      console.warn(`TD error for "${q}":`, err.message);
+    }
+  }
+  
+  console.log(`      ✓ Found ${allResults.length} unique torrents`);
+  return allResults.slice(0, 10);
+}
+
+// ====== LimeTorrents (يعمل غالباً) ======
+async function searchLimeTorrents(query) {
   try {
-    const targetUrl = `https://www.torrentdownloads.pro/search/?search=${encodeURIComponent(query)}&s_cat=4`; // 4 = movies
+    const targetUrl = `https://www.limetorrents.info/search/all/${encodeURIComponent(query)}/`;
     const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
     
-    console.log(`   → TorrentDownloads`);
     const response = await fetchURL(proxyUrl);
     if (response.status !== 200 || !response.data?.contents) return [];
     
     const html = response.data.contents;
     const results = [];
     
-    // البحث عن روابط الـ torrents من جدول النتائج
-    const torrentRegex = /<a\s+href="(\/torrent\/\d+\/[^"]+)"[^>]*>([^<]+)<\/a>/g;
+    // LimeTorrents له magnet في صفحات التفاصيل
+    const torrentRegex = /<a\s+href="(\/torrent\/[^"]+)"[^>]*>([^<]+)<\/a>/g;
     let match;
     while ((match = torrentRegex.exec(html)) !== null) {
       const torrentName = match[2].trim();
-      
-      // فلترة: نتجاهل الملفات الصوتية، الألعاب، البرامج
       const lower = torrentName.toLowerCase();
+      
       if (lower.includes('.mp3') || lower.includes('soundtrack')) continue;
-      if (lower.includes('kms') || lower.includes('activator')) continue;
-      if (lower.includes('crack') || lower.includes('patch')) continue;
-      if (lower.includes('game ') || lower.includes('android')) continue;
+      if (lower.includes('game') || lower.includes('android')) continue;
       
       results.push({
         name: torrentName,
@@ -101,16 +158,31 @@ async function searchTorrentDownloads(query) {
                 lower.includes('720p') ? '720p' : 
                 lower.includes('2160p') || lower.includes('4k') ? '4K' : '480p',
         size: 0,
-        source: 'torrentdownloads',
+        source: 'limetorrents',
         magnet: null,
       });
     }
     
-    console.log(`      ✓ Found ${results.length} relevant torrents`);
-    return results.slice(0, 10);
+    return results.slice(0, 5);
   } catch (err) {
-    console.warn('TorrentDownloads search error:', err.message);
     return [];
+  }
+}
+
+// جلب magnet من LimeTorrents
+async function getMagnetFromLimeTorrent(urlPath) {
+  try {
+    const targetUrl = `https://www.limetorrents.info${urlPath}`;
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+    
+    const response = await fetchURL(proxyUrl);
+    if (response.status !== 200 || !response.data?.contents) return null;
+    
+    const html = response.data.contents;
+    const magnetMatch = html.match(/(magnet:\?xt=urn:btih:[a-fA-F0-9]{40}[^"<\s']*)/);
+    return magnetMatch ? magnetMatch[1] : null;
+  } catch (err) {
+    return null;
   }
 }
 
@@ -134,38 +206,48 @@ async function getMagnetFromTorrentPage(urlPath) {
 }
 
 // ====== البحث الموحد + جلب magnets بالتوازي ======
+// ====== البحث الموحد + جلب magnets بالتوازي ======
 async function searchAllSources(query, type) {
   console.log(`🔍 Searching: "${query}"`);
   
-  // 1) torrentdownloads.pro
+  // 1) torrentdownloads.pro (الأساسي)
   const tdResults = await searchTorrentDownloads(query);
   
-  if (tdResults.length === 0) {
+  // 2) LimeTorrents (كمصدر إضافي)
+  const ltResults = await searchLimeTorrents(query);
+  
+  const allResults = [...tdResults, ...ltResults];
+  
+  if (allResults.length === 0) {
     console.log(`❌ No torrents found`);
     return [];
   }
   
-  // 2) جلب magnets لكل torrent (بالتوازي)
-  console.log(`📥 Fetching magnets for ${tdResults.length} torrents...`);
+  // 3) جلب magnets لكل torrent
+  console.log(`📥 Fetching magnets for ${allResults.length} torrents...`);
   
-  const magnetPromises = tdResults.map(async (torrent) => {
-    const magnet = await getMagnetFromTorrentPage(torrent.url_path);
+  const magnetPromises = allResults.map(async (torrent) => {
+    let magnet = null;
+    if (torrent.source === 'torrentdownloads') {
+      magnet = await getMagnetFromTorrentPage(torrent.url_path);
+    } else if (torrent.source === 'limetorrents') {
+      magnet = await getMagnetFromLimeTorrent(torrent.url_path);
+    }
+    
     if (magnet) {
       torrent.magnet = magnet;
       torrent.filename = torrent.name;
-      return true;
     }
-    return false;
   });
   
   await Promise.all(magnetPromises);
   
-  // فلترة: بس اللي عندهم magnet
-  const withMagnets = tdResults.filter(t => t.magnet);
+  const withMagnets = allResults.filter(t => t.magnet);
   console.log(`📊 Got ${withMagnets.length} magnets`);
   
   return withMagnets;
 }
+
 
 // ====== تقييم الجودة ======
 function getQualityScore(title) {
