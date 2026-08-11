@@ -24,7 +24,7 @@ if (!RD_TOKEN) {
   process.exit(1);
 }
 
-// ====== دالة طلب HTTP ======
+// ====== دالة طلب HTTP عامة ======
 function fetchURL(url, options = {}) {
   return new Promise((resolve, reject) => {
     const protocol = url.startsWith('https') ? https : http;
@@ -32,7 +32,7 @@ function fetchURL(url, options = {}) {
       method: options.method || 'GET',
       headers: {
         'Authorization': `Bearer ${RD_TOKEN}`,
-        'User-Agent': 'BlueStream/3.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
         ...(options.headers || {}),
       },
     };
@@ -60,9 +60,8 @@ const TMDB_KEY = "570589dd8a1dac1a24fc6f98c18d1e59";
 
 async function getTMDBMeta(id, type) {
   try {
-    // نستخدم en-US عشان نرجع English title (أهم للبحث في Torrents)
     const path = type === 'movie' ? 'movie' : 'tv';
-    const url = `https://api.themoviedb.org/3/${path}/${id}?api_key=${TMDB_KEY}&language=en-US&append_to_response=translations`;
+    const url = `https://api.themoviedb.org/3/${path}/${id}?api_key=${TMDB_KEY}&language=en-US`;
     const response = await fetchURL(url);
     return response.status === 200 ? response.data : null;
   } catch (err) {
@@ -70,13 +69,94 @@ async function getTMDBMeta(id, type) {
   }
 }
 
-// ====== البحث في Real-Debrid ======
+// ====== YTS.mx (أفلام فقط) ======
+async function searchYTS(query) {
+  try {
+    const url = `https://yts.mx/api/v2/list_movies.json?query_term=${encodeURIComponent(query)}&limit=10`;
+    const response = await fetchURL(url);
+    if (response.status !== 200 || !response.data?.data?.movies) return [];
+    
+    return response.data.data.movies.map(m => ({
+      filename: `${m.title_long || m.title} ${m.year || ''} [${m.quality || '1080p'}]`,
+      magnet: `magnet:?xt=urn:btih:${m.hash}`,
+      quality: m.quality || '1080p',
+      size_mb: m.size_mb || 0,
+      source: 'yts',
+    }));
+  } catch (err) {
+    console.warn('YTS error:', err.message);
+    return [];
+  }
+}
+
+// ====== 1337x عبر AllOrigins Scraper ======
+async function search1337x(query) {
+  try {
+    const targetUrl = `https://1337x.to/search/${encodeURIComponent(query)}/1/`;
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+    
+    const response = await fetchURL(proxyUrl);
+    if (response.status !== 200 || !response.data?.contents) return [];
+    
+    const html = response.data.contents;
+    const magnets = [];
+    
+    // البحث عن Magnet Links
+    const magnetRegex = /href="(magnet:\?xt=urn:btih:[a-fA-F0-9]{40}[^"]*)"/g;
+    let match;
+    while ((match = magnetRegex.exec(html)) !== null) {
+      magnets.push({
+        filename: `1337x-result-${match[1].substring(20, 40)}`,
+        magnet: match[1],
+        source: '1337x',
+      });
+    }
+    return magnets.slice(0, 10);
+  } catch (err) {
+    console.warn('1337x error:', err.message);
+    return [];
+  }
+}
+
+// ====== PirateBay عبر Scraper ======
+async function searchPirateBay(query) {
+  try {
+    const targetUrl = `https://thepiratebay.org/search/${encodeURIComponent(query)}/1/99/0`;
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+    
+    const response = await fetchURL(proxyUrl);
+    if (response.status !== 200 || !response.data?.contents) return [];
+    
+    const html = response.data.contents;
+    const magnets = [];
+    
+    const magnetRegex = /href="(magnet:\?xt=urn:btih:[a-fA-F0-9]{40}[^"]*)"/g;
+    let match;
+    while ((match = magnetRegex.exec(html)) !== null) {
+      magnets.push({
+        filename: `piratebay-result-${match[1].substring(20, 40)}`,
+        magnet: match[1],
+        source: 'piratebay',
+      });
+    }
+    return magnets.slice(0, 10);
+  } catch (err) {
+    console.warn('PirateBay error:', err.message);
+    return [];
+  }
+}
+
+// ====== Real-Debrid Search ======
 async function searchRD(query) {
   try {
     const url = `https://api.real-debrid.com/rest/1.0/torrents?search=${encodeURIComponent(query)}&limit=20`;
     const response = await fetchURL(url);
     if (response.status !== 200) return [];
-    return response.data || [];
+    return (response.data || []).map(t => ({
+      filename: t.filename,
+      magnet: t.magnet,
+      source: 'rd',
+    }));
   } catch (err) {
     return [];
   }
@@ -84,6 +164,7 @@ async function searchRD(query) {
 
 // ====== تقييم الجودة ======
 function getQualityScore(filename) {
+  if (!filename) return 0;
   const f = filename.toLowerCase();
   if (f.includes('2160p') || f.includes('4k') || f.includes('uhd')) return 400;
   if (f.includes('1080p') || f.includes('fhd')) return 300;
@@ -92,171 +173,134 @@ function getQualityScore(filename) {
   return 50;
 }
 
-// ====== قاموس عربي → إنجليزي ======
-function guessEnglishTitle(arabicTitle) {
-  if (!arabicTitle) return null;
-  const dictionary = {
-    'الماتريكس': 'The Matrix',
-    'البداية': 'Inception',
-    'بين النجوم': 'Interstellar',
-    'الخلاص': 'The Avengers',
-    'العمق': 'Avatar',
-    'الأسود': 'Black Panther',
-    'العنكبوت': 'Spider-Man',
-    'البطل': 'Hero',
-    'الفارس': 'The Dark Knight',
-    'الحرب': 'War',
-    'الزمن': 'Time',
-    'الوعد': 'The Promise',
-    'صراع العروش': 'Game of Thrones',
-    'الموتى': 'The Walking Dead',
-    'العراب': 'The Godfather',
-    'القائمة': 'The List',
-  };
-  for (const [ar, en] of Object.entries(dictionary)) {
-    if (arabicTitle.includes(ar)) return en;
+// ====== البحث الشامل في كل المصادر ======
+async function searchAllSources(query) {
+  const results = [];
+  
+  console.log(`   → Searching: "${query}"`);
+  
+  // 1) YTS (أفلام فقط، سريع)
+  const ytsResults = await searchYTS(query);
+  if (ytsResults.length > 0) {
+    console.log(`      ✓ YTS: ${ytsResults.length} results`);
+    results.push(...ytsResults);
   }
-  return null;
+  
+  // 2) 1337x (مسلسلات + أنمي + أفلام)
+  const x1337Results = await search1337x(query);
+  if (x1337Results.length > 0) {
+    console.log(`      ✓ 1337x: ${x1337Results.length} results`);
+    results.push(...x1337Results);
+  }
+  
+  // 3) PirateBay (backup)
+  if (results.length < 3) {
+    const pbResults = await searchPirateBay(query);
+    if (pbResults.length > 0) {
+      console.log(`      ✓ PirateBay: ${pbResults.length} results`);
+      results.push(...pbResults);
+    }
+  }
+  
+  // 4) Real-Debrid (إذا RD عنده نتائج)
+  if (results.length < 3) {
+    const rdResults = await searchRD(query);
+    if (rdResults.length > 0) {
+      console.log(`      ✓ RD: ${rdResults.length} results`);
+      results.push(...rdResults);
+    }
+  }
+  
+  return results;
 }
 
-// ====== اختيار أفضل ملف ======
-function pickBestFile(torrent) {
-  if (!torrent.files || torrent.files.length === 0) return null;
-
-  let candidates = torrent.files.filter(f => {
-    const name = (f.path || '').toLowerCase();
-    if (name.includes('sample') || name.includes('trailer')) return false;
-    if (name.includes('cam') || name.includes('ts')) return false;
-    if (name.includes('.txt') || name.includes('.nfo')) return false;
-    return /\.(mkv|mp4|avi|mov|webm)$/i.test(name);
-  });
-
-  if (candidates.length === 0) return null;
-
-  candidates.sort((a, b) => {
-    const scoreA = getQualityScore(a.path);
-    const scoreB = getQualityScore(b.path);
-    if (scoreA !== scoreB) return scoreB - scoreA;
-    return (b.bytes || 0) - (a.bytes || 0);
-  });
-
-  return candidates[0];
-}
-
-// ====== البحث الذكي عن Torrent ======
+// ====== البحث الذكي ======
 async function findTorrent(meta, type, season = null, episode = null) {
   if (!meta) return null;
 
-  // ====== استخراج كل الأسماء الممكنة ======
   const originalTitle = (meta.original_title || meta.original_name || '').trim();
-  const englishTitle = (meta.title || meta.name || '').trim(); // TMDB en-US
-  const arabicTitle = ''; // ما نستخدمه - نفضل English للبحث
-
-  // الأنمي: جرب الاسم الياباني
-  const originalLanguage = meta.original_language || '';
-  const isAnime = meta.genres?.some(g => g.id === 16) && originalLanguage === 'ja';
-
+  const englishTitle = (meta.title || meta.name || '').trim();
   const year = (meta.release_date || meta.first_air_date || '').slice(0, 4);
 
-  // ====== بناء الاستعلامات ======
-  const queries = [];
   const searchTerms = [];
-
-  // 1. English title (الأولوية الأولى)
   if (originalTitle) searchTerms.push(originalTitle);
   if (englishTitle && englishTitle !== originalTitle) searchTerms.push(englishTitle);
 
-  // 2. للأنمي: الاسم الياباني
-  if (isAnime && originalTitle) {
-    searchTerms.push(originalTitle);
-  }
+  console.log(`🔍 Searching ${searchTerms.length} terms`);
 
-  // 3. أسماء إنجليزية محتملة من العربي
-  if (arabicTitle) {
-    const englishGuess = guessEnglishTitle(arabicTitle);
-    if (englishGuess && !searchTerms.includes(englishGuess)) {
-      searchTerms.push(englishGuess);
-    }
-  }
-
-  // بناء الاستعلامات
-  for (const term of searchTerms) {
-    if (type === 'movie') {
-      // أفلام: اسم + سنة
-      if (year) queries.push(`${term} ${year}`);
-      queries.push(term);
-    } else {
-      // مسلسل/أنمي: اسم + S01E01
-      if (season && episode) {
-        const s = String(season).padStart(2, '0');
-        const e = String(episode).padStart(2, '0');
-        queries.push(`${term} S${s}E${e}`);
-        queries.push(`${term} ${season}x${episode}`);
-      }
-      if (year) queries.push(`${term} ${year}`);
-      queries.push(term);
-    }
-  }
-
-  console.log(`🔍 Will try ${queries.length} queries for: "${originalTitle || englishTitle}"`);
-
-  // ====== تجربة كل الاستعلامات ======
   const allTorrents = [];
-  for (const q of queries) {
-    console.log(`   → "${q}"`);
-    const results = await searchRD(q);
-    if (results && results.length > 0) {
-      console.log(`      Found ${results.length} results`);
-      allTorrents.push(...results);
-    }
+  for (const term of searchTerms) {
+    const searchQuery = type === 'movie' 
+      ? (year ? `${term} ${year}` : term)
+      : (season && episode 
+          ? `${term} S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`
+          : term);
+
+    const sources = await searchAllSources(searchQuery);
+    allTorrents.push(...sources);
   }
 
-  // إزالة التكرار
-  const uniqueTorrents = Array.from(
-    new Map(allTorrents.map(t => [t.id || t.hash, t])).values()
-  );
+  console.log(`📊 Total: ${allTorrents.length} torrents from all sources`);
 
-  console.log(`📊 Total unique torrents: ${uniqueTorrents.length}`);
+  if (allTorrents.length === 0) return null;
 
-  if (uniqueTorrents.length === 0) return null;
-
-  // ترتيب حسب الجودة
-  uniqueTorrents.sort((a, b) => {
-    const qualityA = getQualityScore(a.filename || '');
-    const qualityB = getQualityScore(b.filename || '');
-    return qualityB - qualityA;
+  // ترتيب: YTS أولاً (أفلام بجودة عالية)، ثم حسب الجودة
+  allTorrents.sort((a, b) => {
+    // YTS تحصل أولوية (جودة مضمونة)
+    if (a.source === 'yts' && b.source !== 'yts') return -1;
+    if (b.source === 'yts' && a.source !== 'yts') return 1;
+    
+    const qa = getQualityScore(a.filename);
+    const qb = getQualityScore(b.filename);
+    return qb - qa;
   });
 
-  // تجربة كل torrent
+  // نحتاج نتأكد من تطابق الاسم
   const titleLower = (originalTitle || englishTitle).toLowerCase();
   const titleWords = titleLower.split(/\s+/).filter(w => w.length > 2);
 
-  for (const torrent of uniqueTorrents) {
+  for (const torrent of allTorrents) {
+    // YTS نتأكد من تطابق العنوان من الـ filename
     const filename = (torrent.filename || '').toLowerCase();
+    
+    // للـ YTS نتأكد من تطابق السنة
+    if (torrent.source === 'yts' && year) {
+      if (!filename.includes(year)) continue;
+    }
+    
     const matchCount = titleWords.filter(word => filename.includes(word)).length;
     const matchRatio = titleWords.length > 0 ? matchCount / titleWords.length : 0;
 
-    if (matchRatio >= 0.5) {
-      const file = pickBestFile(torrent);
-      if (file) {
-        console.log(`✅ Match: ${torrent.filename} (${Math.round(matchRatio * 100)}%)`);
-        return { torrent, file, magnet: torrent.magnet };
-      }
+    if (matchRatio >= 0.4 || torrent.source === 'yts') {
+      console.log(`✅ Found: ${torrent.filename.substring(0, 60)} (${torrent.source})`);
+      return { 
+        torrent: { 
+          filename: torrent.filename,
+          magnet: torrent.magnet,
+        }, 
+        file: { 
+          id: torrent.source === 'rd' ? 0 : 0,
+          path: torrent.filename,
+          bytes: (torrent.size_mb || 0) * 1024 * 1024,
+        },
+        magnet: torrent.magnet,
+        source: torrent.source,
+      };
     }
   }
 
-  // Fallback
-  const firstTorrent = uniqueTorrents[0];
-  const firstFile = pickBestFile(firstTorrent);
-  if (firstFile) {
-    console.log(`⚠️ Fallback: ${firstTorrent.filename}`);
-    return { torrent: firstTorrent, file: firstFile, magnet: firstTorrent.magnet };
-  }
-
-  return null;
+  // Fallback: أول نتيجة
+  const first = allTorrents[0];
+  console.log(`⚠️ Fallback: ${first.filename} (${first.source})`);
+  return { 
+    torrent: { filename: first.filename, magnet: first.magnet }, 
+    file: { id: 0, path: first.filename, bytes: 0 },
+    magnet: first.magnet,
+    source: first.source,
+  };
 }
 
-// ====== RD API calls ======
+// ====== RD Operations ======
 async function addMagnet(magnet) {
   try {
     const response = await fetchURL('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
@@ -283,7 +327,7 @@ async function selectTorrentFile(torrentId, fileId) {
   }
 }
 
-async function waitForTorrent(torrentId, maxWaitMs = 120000) {
+async function waitForTorrent(torrentId, maxWaitMs = 180000) {
   const startTime = Date.now();
   const interval = 3000;
 
@@ -292,7 +336,7 @@ async function waitForTorrent(torrentId, maxWaitMs = 120000) {
       const response = await fetchURL(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`);
       if (response.status === 200) {
         const status = response.data.status;
-        console.log(`📊 Status: ${status}`);
+        console.log(`📊 RD Status: ${status}`);
         if (status === 'downloaded' || status === 'waiting_files_selection') {
           return response.data;
         }
@@ -326,7 +370,7 @@ app.get("/api/play", async (req, res) => {
   }
 
   try {
-    // 1) جلب metadata من TMDB (بالإنجليزي)
+    // 1) جلب metadata من TMDB
     const meta = await getTMDBMeta(id, type);
     if (!meta) return res.status(404).json({ success: false, error: "TMDB not found" });
 
@@ -335,49 +379,63 @@ app.get("/api/play", async (req, res) => {
 
     console.log(`\n🎬 ${displayTitle} (${year}) | ${type} S${season || 1}E${episode || 1}`);
 
-    // 2) البحث في Real-Debrid (يستخدم original_title داخلياً)
+    // 2) البحث في كل المصادر
     const found = await findTorrent(meta, type, season, episode);
 
     if (!found) {
       return res.status(404).json({
         success: false,
-        error: `لم يتم العثور على "${displayTitle}"`,
+        error: `لم يتم العثور على "${displayTitle}" في أي مصدر`,
         title: displayTitle,
         year,
       });
     }
 
-    // 3) إضافة Magnet
+    console.log(`📥 Adding magnet to RD from ${found.source}...`);
+
+    // 3) إضافة Magnet لـ Real-Debrid
     const magnetData = await addMagnet(found.magnet);
-    if (!magnetData) return res.status(500).json({ success: false, error: "Failed to add magnet" });
+    if (!magnetData) return res.status(500).json({ success: false, error: "Failed to add magnet to RD" });
 
-    // 4) اختيار الملف
-    await selectTorrentFile(magnetData.id, found.file.id);
+    // 4) اختيار الملف (إذا من RD يحتاج ID، غير ذلك تخطي)
+    if (found.source === 'rd') {
+      await selectTorrentFile(magnetData.id, found.file.id);
+    }
 
-    // 5) انتظار التحميل
+    // 5) انتظار التحميل في RD
     const torrentInfo = await waitForTorrent(magnetData.id);
     if (!torrentInfo) return res.status(500).json({ success: false, error: "Download timeout" });
 
     // 6) إيجاد رابط الملف
-    const selectedFile = torrentInfo.files.find(f => f.id === found.file.id) || found.file;
-    if (!selectedFile.links || selectedFile.links.length === 0) {
-      return res.status(500).json({ success: false, error: "No links found" });
+    let downloadLink = null;
+    
+    if (found.source === 'rd') {
+      // من RD torrents
+      const selectedFile = torrentInfo.files.find(f => f.id === found.file.id) || torrentInfo.files[0];
+      downloadLink = selectedFile?.links?.[0];
+    } else {
+      // من YTS/1337x → RD unrestrict مباشرة
+      downloadLink = torrentInfo.links?.[0];
+    }
+
+    if (!downloadLink) {
+      return res.status(500).json({ success: false, error: "No download links found" });
     }
 
     // 7) استخراج الرابط المباشر
-    const unrestricted = await unrestrictLink(selectedFile.links[0]);
+    const unrestricted = await unrestrictLink(downloadLink);
     if (!unrestricted) return res.status(500).json({ success: false, error: "Unrestrict failed" });
 
     return res.json({
       success: true,
-      provider: 'real-debrid',
+      provider: `real-debrid+${found.source}`,
       quality: getQualityScore(found.torrent.filename) >= 300 ? '1080p' : '720p',
       title: displayTitle,
       year,
       filename: found.torrent.filename,
       stream_url: unrestricted.download,
       subtitles: [],
-      size_mb: Math.round((selectedFile.bytes || 0) / 1024 / 1024),
+      size_mb: Math.round((unrestricted.filesize || 0) / 1024 / 1024),
       poster: meta.poster_path ? `https://image.tmdb.org/t/p/w500${meta.poster_path}` : null,
     });
 
@@ -399,9 +457,8 @@ app.get("/api/metadata", async (req, res) => {
 // ====== Health Check ======
 app.get("/", (req, res) => {
   res.json({
-    status: "✅ Real-Debrid Scraper API",
-    version: "3.2",
-    provider: "Real-Debrid + TMDB",
+    status: "✅ Real-Debrid Scraper API v3.3",
+    provider: "Real-Debrid + YTS + 1337x + PirateBay",
     endpoints: {
       play: "/api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1",
       metadata: "/api/metadata?id={tmdb_id}&type={movie|tv}",
@@ -410,6 +467,6 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🎬 Real-Debrid Scraper API v3.2 running on port ${PORT}`);
+  console.log(`\n🎬 Real-Debrid Scraper API v3.3 running on port ${PORT}`);
   console.log(`✅ Token: ${RD_TOKEN ? 'Loaded' : 'MISSING'}`);
 });
