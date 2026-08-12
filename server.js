@@ -1,1830 +1,1169 @@
-// ============================================================
-// BlueStream API v7.6.1
-// Streaming-first:
-// Torrentio -> Real-Debrid -> HLS / MP4 / WebM / DASH
-//
-// Important:
-// - mediaInfos is optional.
-// - transcode is optional.
-// - MP4 streamable fallback is supported.
-// - /api/stream returns an absolute URL through /api/play.
-// - No old Real-Debrid playback URL is trusted from cache.
-// ============================================================
+// server.js — Real-Debrid + OpenSubtitles + Torrentio (25+ source aggregator)
+
+// v7.3: Torrentio يضمن البحث في 25+ موقع بنقرة واحدة
+
 
 const express = require("express");
+
 const https = require("https");
+
 const http = require("http");
+
 const { URL } = require("url");
+
 const cache = require("./cache");
 
 
-// ============================================================
-// DATABASE
-// ============================================================
-
 try {
+
   cache.initPool();
 
-  cache
-    .runMigrations()
-    .catch((err) => {
-      console.warn(
-        "⚠️ Auto-migration skipped:",
-        err.message
-      );
-    });
+  cache.runMigrations().catch(err => console.warn('⚠️ Auto-migration skipped:', err.message));
+
 } catch (err) {
-  console.warn(
-    "⚠️ MySQL init failed:",
-    err.message
-  );
+
+  console.warn('⚠️ MySQL init failed (cache will be disabled):', err.message);
+
 }
 
-
-// ============================================================
-// APP
-// ============================================================
 
 const app = express();
 
 app.use(express.json());
 
+
 app.use((req, res, next) => {
-  res.header(
-    "Access-Control-Allow-Origin",
-    "*"
-  );
 
-  res.header(
-    "Access-Control-Allow-Headers",
-    "*"
-  );
+  res.header('Access-Control-Allow-Origin', '*');
 
-  res.header(
-    "Access-Control-Allow-Methods",
-    "GET, POST, PUT, PATCH, DELETE, OPTIONS"
-  );
+  res.header('Access-Control-Allow-Headers', '*');
 
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(200);
-  }
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
 
   next();
+
 });
 
 
-// ============================================================
-// CONFIG
-// ============================================================
+const PORT = process.env.PORT || 3000;
 
-const PORT =
-  process.env.PORT || 3000;
+const RD_TOKEN = process.env.RD_TOKEN;
 
-const RD_TOKEN =
-  process.env.RD_TOKEN;
 
 if (!RD_TOKEN) {
-  console.error(
-    "❌ خطأ: لم يتم تعيين RD_TOKEN"
-  );
+
+  console.error("❌ خطأ: لم يتم تعيين RD_TOKEN");
 
   process.exit(1);
+
 }
 
-const TMDB_KEY =
-  process.env.TMDB_KEY ||
-  "570589dd8a1dac1a24fc6f98c18d1e59";
 
-const OS_API_KEY =
-  process.env.OPENSUBTITLES_API_KEY ||
-  "p9i6HLoYyyJVPbVIBM5c9swo5MjqCV8I";
+const TMDB_KEY = process.env.TMDB_KEY || "570589dd8a1dac1a24fc6f98c18d1e59";
 
-const OS_BASE =
-  "https://api.opensubtitles.com/api/v1";
+const OS_API_KEY = process.env.OPENSUBTITLES_API_KEY || "p9i6HLoYyyJVPbVIBM5c9swo5MjqCV8I";
 
-const TORRENTIO_BASE =
-  "https://torrentio.strem.fun";
+const OS_BASE = "https://api.opensubtitles.com/api/v1";
 
 
-// ============================================================
-// HTTP HEADERS
-// ============================================================
+// 🆕 Torrentio — 25+ مصدر مدمج، بدون API key، يدعم Real-Debrid
+
+const TORRENTIO_BASE = "https://torrentio.strem.fun";
+
 
 const BROWSER_HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
 
-  "Accept":
-    "application/json,text/html,application/xhtml+xml,*/*",
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 
-  "Accept-Language":
-    "en-US,en;q=0.5",
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
 
-  "Connection":
-    "keep-alive"
+  'Accept-Language': 'en-US,en;q=0.5',
+
+  'Connection': 'keep-alive',
+
+  'Upgrade-Insecure-Requests': '1',
+
 };
 
 
-// ============================================================
-// GENERIC HTTP REQUEST
-// ============================================================
+// Short-lived cache for fresh Real-Debrid direct URLs.
+// HTML5 video sends multiple Range requests; without this cache
+// every Range request would call RD again.
+const freshStreamUrlCache = new Map();
+const FRESH_STREAM_CACHE_TTL = 90 * 1000;
 
-function fetchURL(
-  url,
-  options = {}
-) {
-  return new Promise(
-    (resolve, reject) => {
-      let parsed;
+function getFreshStreamCache(key) {
+  const entry = freshStreamUrlCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    freshStreamUrlCache.delete(key);
+    return null;
+  }
+  return entry;
+}
 
-      try {
-        parsed = new URL(url);
-      } catch (err) {
-        return reject(err);
-      }
+function setFreshStreamCache(key, value) {
+  freshStreamUrlCache.set(key, {
+    ...value,
+    expiresAt: Date.now() + FRESH_STREAM_CACHE_TTL
+  });
+}
 
-      const isHttps =
-        parsed.protocol === "https:";
 
-      const lib =
-        isHttps
-          ? https
-          : http;
+function fetchURL(url, options = {}) {
 
-      const requestOptions = {
-        method:
-          options.method || "GET",
+  return new Promise((resolve, reject) => {
 
-        hostname:
-          parsed.hostname,
+    try {
 
-        port:
-          parsed.port ||
-          (isHttps ? 443 : 80),
+      const parsed = new URL(url);
 
-        path:
-          parsed.pathname +
-          parsed.search,
+      const isHttps = parsed.protocol === 'https:';
 
-        headers: {
-          ...BROWSER_HEADERS,
-          ...(options.headers || {})
-        },
+      const lib = isHttps ? https : http;
 
-        timeout:
-          options.timeout || 15000
+      const reqOpts = {
+
+        method: options.method || 'GET',
+
+        hostname: parsed.hostname,
+
+        port: parsed.port || (isHttps ? 443 : 80),
+
+        path: parsed.pathname + parsed.search,
+
+        headers: { ...BROWSER_HEADERS, ...(options.headers || {}) },
+
+        timeout: options.timeout || 15000,
+
       };
 
-      delete requestOptions.headers[
-        "Accept-Encoding"
-      ];
+      delete reqOpts.headers['Accept-Encoding'];
 
-      const request =
-        lib.request(
-          requestOptions,
-          (response) => {
-            let body = "";
+      const req = lib.request(reqOpts, (res) => {
 
-            response.on(
-              "data",
-              (chunk) => {
-                body += chunk;
-              }
-            );
+        let data = '';
 
-            response.on(
-              "end",
-              () => {
-                let data = body;
+        res.on('data', (chunk) => data += chunk);
 
-                try {
-                  data =
-                    JSON.parse(body);
-                } catch {}
+        res.on('end', () => {
 
-                resolve({
-                  status:
-                    response.statusCode,
+          try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
 
-                  headers:
-                    response.headers,
+          catch { resolve({ status: res.statusCode, data }); }
 
-                  data
-                });
-              }
-            );
-          }
-        );
+        });
 
-      request.on(
-        "timeout",
-        () => {
-          request.destroy(
-            new Error(
-              "Request timeout"
-            )
-          );
-        }
-      );
+      });
 
-      request.on(
-        "error",
-        reject
-      );
+      req.on('timeout', () => req.destroy(new Error('Request timeout')));
 
-      if (options.body) {
-        request.write(
-          options.body
-        );
-      }
+      req.on('error', reject);
 
-      request.end();
+      if (options.body) req.write(options.body);
+
+      req.end();
+
+    } catch (err) { reject(err); }
+
+  });
+
+}
+
+
+async function getTMDBMeta(id, type) {
+
+  try {
+
+    const path = type === 'movie' ? 'movie' : 'tv';
+
+    const url = `https://api.themoviedb.org/3/${path}/${id}?api_key=${TMDB_KEY}&language=en-US&append_to_response=external_ids`;
+
+    const response = await fetchURL(url, { timeout: 10000 });
+
+    return response.status === 200 ? response.data : null;
+
+  } catch { return null; }
+
+}
+
+
+function decodeHTMLEntities(text) {
+
+  if (!text) return '';
+
+  return text
+
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+
+    .replace(/&#x2F;/g, '/').replace(/&#x27;/g, "'");
+
+}
+
+
+function parseSize(sizeStr) {
+
+  if (!sizeStr) return 0;
+
+  const m = sizeStr.match(/([\d.]+)\s*(GB|MB|KB|TB)/i);
+
+  if (!m) return 0;
+
+  const v = parseFloat(m[1]);
+
+  const u = m[2].toUpperCase();
+
+  const mult = { KB: 1024, MB: 1024*1024, GB: 1024*1024*1024, TB: 1024*1024*1024*1024 };
+
+  return Math.round(v * (mult[u] || 0));
+
+}
+
+
+// =============================================================
+
+// 🆕 Torrentio: يبحث في 25+ موقع ويعطي infoHash
+
+// =============================================================
+
+async function searchTorrentio(imdbId, type, season, episode) {
+
+  try {
+
+    let url;
+
+    if (type === 'movie') {
+
+      url = `${TORRENTIO_BASE}/stream/movie/${imdbId}.json`;
+
+    } else {
+
+      url = `${TORRENTIO_BASE}/stream/series/${imdbId}:${season || 1}:${episode || 1}.json`;
+
     }
-  );
-}
 
 
-// ============================================================
-// HELPERS
-// ============================================================
+    console.log(`   🔍 Torrentio: ${url.replace(TORRENTIO_BASE, '')}`);
 
-function sleep(ms) {
-  return new Promise(
-    (resolve) =>
-      setTimeout(resolve, ms)
-  );
-}
+    const response = await fetchURL(url, { timeout: 20000 });
 
-function parseSize(
-  size
-) {
-  if (!size) {
-    return 0;
+    if (response.status !== 200) {
+
+      console.log(`   ⚠ Torrentio returned ${response.status}`);
+
+      return [];
+
+    }
+
+
+    const data = response.data;
+
+    if (!data?.streams?.length) {
+
+      console.log(`   📭 Torrentio: لا نتائج`);
+
+      return [];
+
+    }
+
+
+    // استخراج الجودة من title Torrentio
+
+    const results = [];
+
+    for (const stream of data.streams) {
+
+      if (!stream.infoHash) continue;
+
+
+      const title = stream.title || "";
+
+      const lower = title.toLowerCase();
+
+
+      // استخراج الجودة من title
+
+      let quality = "?";
+
+      if (lower.includes('4k') || lower.includes('2160p') || lower.includes('uhd')) quality = "4K";
+
+      else if (lower.includes('1080p')) quality = "1080p";
+
+      else if (lower.includes('720p')) quality = "720p";
+
+      else if (lower.includes('480p')) quality = "480p";
+
+
+      // استخراج source من title (آخر سطر قبل ال emoji)
+
+      const sourceMatch = title.match(/⚙️\s*([^\n🇬🇧🇸🇦🇪🇸🇫🇷🇩🇪🇮🇹🇯🇵🇰🇷🇨🇳🇷🇺🇵🇹🇮🇳]+)/);
+
+      const source = sourceMatch ? sourceMatch[1].trim() : "torrentio";
+
+
+      // استخراج الحجم من title
+
+      const sizeMatch = title.match(/💾\s*([\d.]+\s*[GMK]B)/);
+
+      const sizeStr = sizeMatch ? sizeMatch[1] : "";
+
+
+      // بناء magnet من infoHash
+
+      const magnet = buildMagnet(stream.infoHash, title, stream.sources || []);
+
+
+      results.push({
+
+        name: title.split('\n')[0] || title,
+
+        title,
+
+        url_path: null,
+
+        magnet,
+
+        quality,
+
+        size_str: sizeStr,
+
+        size: parseSize(sizeStr),
+
+        seeds: 0, // Torrentio ما يعطي seeds
+
+        source: `torrentio-${source.toLowerCase().replace(/\s+/g, '')}`,
+
+        infoHash: stream.infoHash,
+
+        fileIdx: stream.fileIdx || 0,
+
+      });
+
+    }
+
+
+    console.log(`   ✅ Torrentio: ${results.length} نتيجة`);
+
+    return results;
+
+  } catch (err) {
+
+    console.warn(`   ⚠ Torrentio error: ${err.message}`);
+
+    return [];
+
   }
 
-  const match =
-    String(size).match(
-      /([\d.]+)\s*(KB|MB|GB|TB)/i
+}
+
+
+function buildMagnet(infoHash, title, trackers) {
+
+  // Default trackers (DHT/PEX + public)
+
+  const defaultTrackers = [
+
+    "udp://tracker.opentrackr.org:1337/announce",
+
+    "udp://open.demonii.com:1337/announce",
+
+    "udp://tracker.openbittorrent.com:80/announce",
+
+    "udp://tracker.torrent.eu.org:451/announce",
+
+    "udp://exodus.desync.com:6969/announce",
+
+    "udp://open.stealth.si:80/announce",
+
+    "udp://tracker.peerfect.org:6969/announce",
+
+    "udp://tracker.ducks.party:1984/announce",
+
+  ];
+
+
+  // Trackers من Torrentio (عادة أكتر)
+
+  const allTrackers = [
+
+    ...(trackers || [])
+
+      .filter(s => s.startsWith('tracker:'))
+
+      .map(s => s.replace('tracker:', '')),
+
+    ...defaultTrackers,
+
+  ];
+
+
+  // إزالة المكرر
+
+  const uniqueTrackers = [...new Set(allTrackers)];
+
+
+  const encodedName = encodeURIComponent(title.split('\n')[0] || "video");
+
+  const tr = uniqueTrackers.map(t => `&tr=${encodeURIComponent(t)}`).join('');
+
+  return `magnet:?xt=urn:btih:${infoHash}&dn=${encodedName}${tr}`;
+
+}
+
+
+// 🔑 Browser-Playability Score: نرتب حسب اللي يشتغل في المتصفح
+
+//  - mp4 + x264/h264: ✅ يشتغل native (الأعلى أولوية)
+
+//  - mkv + hevc/x264: ⚠️ يحتاج transcoding (أولوية أقل)
+
+//  - webm: ✅ يشتغل في Chrome
+
+function getQualityScore(item) {
+
+  const f = (item.name || item.title || "").toLowerCase();
+
+
+  // نوع الملف (الأهم)
+
+  const isMp4 = f.includes('mp4') || (!f.includes('mkv') && !f.includes('remux') && !f.includes('avi'));
+
+  const isMkv = f.includes('mkv') || f.includes('remux');
+
+  const isWebm = f.includes('webm');
+
+
+  // الكوديك
+
+  const isHevc = f.includes('hevc') || f.includes('h.265') || f.includes('h265') || f.includes('x265') || f.includes('av1');
+
+  const isX264 = f.includes('x264') || f.includes('h.264') || f.includes('h264');
+
+
+  // الجودة
+
+  let resScore = 50;
+
+  if (f.includes('2160p') || f.includes('4k') || f.includes('uhd')) resScore = 400;
+
+  else if (f.includes('1080p') || f.includes('fhd')) resScore = 300;
+
+  else if (f.includes('720p') || f.includes('hdrip')) resScore = 200;
+
+  else if (f.includes('480p') || f.includes('dvdrip')) resScore = 100;
+
+
+  // playability bonus
+
+  let playBonus = 0;
+
+  if (isMp4 && isX264) playBonus = 1000;        // الأفضل: mp4 + x264
+
+  else if (isMp4 && !isHevc) playBonus = 800;   // mp4 + أي كوديك غير HEVC
+
+  else if (isWebm) playBonus = 600;
+
+  else if (isMkv && isX264) playBonus = 200;     // mkv + x264 (شغال في بعض المتصفحات)
+
+  else if (isMkv && isHevc) playBonus = -500;   // الأسوأ: mkv + HEVC (يحتاج transcoding)
+
+  // Remux دائماً HEVC → عقوبة كبيرة
+
+  if (f.includes('remux')) playBonus = Math.min(playBonus, -300);
+
+
+  return resScore + playBonus;
+
+}
+
+
+// =============================================================
+
+// REAL-DEBRID
+
+// =============================================================
+
+
+async function rdAddMagnet(magnet) {
+
+  try {
+
+    const response = await fetchURL('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
+
+      method: 'POST',
+
+      body: `magnet=${encodeURIComponent(magnet)}`,
+
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': `Bearer ${RD_TOKEN}` },
+
+      timeout: 15000,
+
+    });
+
+    return (response.status === 200 || response.status === 201) ? response.data : null;
+
+  } catch { return null; }
+
+}
+
+
+async function rdSelectFiles(torrentId, files = 'all') {
+
+  try {
+
+    const response = await fetchURL(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`, {
+
+      method: 'POST',
+
+      body: `files=${files}`,
+
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': `Bearer ${RD_TOKEN}` },
+
+      timeout: 10000,
+
+    });
+
+    return response.status === 200 || response.status === 204;
+
+  } catch { return false; }
+
+}
+
+
+async function rdGetTorrentInfo(torrentId) {
+
+  try {
+
+    const response = await fetchURL(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`, {
+
+      headers: { 'Authorization': `Bearer ${RD_TOKEN}` }, timeout: 10000,
+
+    });
+
+    return response.status === 200 ? response.data : null;
+
+  } catch { return null; }
+
+}
+
+
+async function rdWaitForTorrent(torrentId, maxWaitMs = 240000) {
+
+  const start = Date.now();
+
+  while (Date.now() - start < maxWaitMs) {
+
+    const info = await rdGetTorrentInfo(torrentId);
+
+    if (info) {
+
+      if (info.status === 'downloaded') return info;
+
+      if (info.status === 'waiting_files_selection') await rdSelectFiles(torrentId, 'all');
+
+      if (['error','magnet_error','virus','dead'].includes(info.status)) return null;
+
+    }
+
+    await new Promise(r => setTimeout(r, 3000));
+
+  }
+
+  return null;
+
+}
+
+
+async function rdUnrestrict(link) {
+
+  try {
+
+    const response = await fetchURL('https://api.real-debrid.com/rest/1.0/unrestrict/link', {
+
+      method: 'POST',
+
+      body: `link=${encodeURIComponent(link)}`,
+
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Authorization': `Bearer ${RD_TOKEN}` },
+
+      timeout: 15000,
+
+    });
+
+    return (response.status === 200 || response.status === 201) ? response.data : null;
+
+  } catch { return null; }
+
+}
+
+
+// =============================================================
+// REAL-DEBRID STREAMING / MEDIA INFO / TRANSCODE
+// =============================================================
+
+// Real-Debrid documents these endpoints as:
+// GET /streaming/mediaInfos/{id}
+// GET /streaming/transcode/{id}
+// The {id} comes from /unrestrict/link.
+// We intentionally inspect mediaInfos first, then ask RD for
+// streaming/transcode variants before falling back to the raw link.
+
+async function rdGetMediaInfos(streamingId) {
+  try {
+    const response = await fetchURL(
+      `https://api.real-debrid.com/rest/1.0/streaming/mediaInfos/${encodeURIComponent(streamingId)}`,
+      {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${RD_TOKEN}` },
+        timeout: 15000,
+      }
     );
 
-  if (!match) {
-    return 0;
-  }
-
-  const value =
-    parseFloat(match[1]);
-
-  const unit =
-    match[2].toUpperCase();
-
-  const multipliers = {
-    KB: 1024,
-    MB: 1024 * 1024,
-    GB: 1024 * 1024 * 1024,
-    TB: 1024 * 1024 * 1024 * 1024
-  };
-
-  return Math.round(
-    value *
-      (multipliers[unit] || 0)
-  );
-}
-
-function getPoster(
-  path
-) {
-  return path
-    ? `https://image.tmdb.org/t/p/w500${path}`
-    : null;
-}
-
-function getBackdrop(
-  path
-) {
-  return path
-    ? `https://image.tmdb.org/t/p/w1280${path}`
-    : null;
-}
-
-
-// ============================================================
-// TMDB
-// ============================================================
-
-async function getTMDBMeta(
-  id,
-  type
-) {
-  try {
-    const mediaPath =
-      type === "movie"
-        ? "movie"
-        : "tv";
-
-    const url =
-      `https://api.themoviedb.org/3/${mediaPath}/${id}` +
-      `?api_key=${TMDB_KEY}` +
-      `&language=en-US` +
-      `&append_to_response=external_ids`;
-
-    const response =
-      await fetchURL(
-        url,
-        {
-          timeout: 10000
-        }
-      );
-
-    if (
-      response.status !== 200
-    ) {
+    if (response.status !== 200) {
+      console.warn(`   ⚠ mediaInfos ${response.status} for ${streamingId}`);
       return null;
     }
 
     return response.data;
-  } catch {
+  } catch (err) {
+    console.warn(`   ⚠ mediaInfos error: ${err.message}`);
     return null;
   }
 }
 
 
-// ============================================================
-// TORRENTIO
-// ============================================================
-
-function buildMagnet(
-  infoHash,
-  title,
-  trackers = []
-) {
-  const defaultTrackers = [
-    "udp://tracker.opentrackr.org:1337/announce",
-    "udp://open.demonii.com:1337/announce",
-    "udp://tracker.openbittorrent.com:80/announce",
-    "udp://tracker.torrent.eu.org:451/announce",
-    "udp://exodus.desync.com:6969/announce",
-    "udp://open.stealth.si:80/announce"
-  ];
-
-  const torrentTrackers =
-    trackers
-      .filter((item) =>
-        String(item).startsWith(
-          "tracker:"
-        )
-      )
-      .map((item) =>
-        String(item).replace(
-          "tracker:",
-          ""
-        )
-      );
-
-  const uniqueTrackers =
-    [
-      ...new Set([
-        ...torrentTrackers,
-        ...defaultTrackers
-      ])
-    ];
-
-  const name =
-    encodeURIComponent(
-      String(title).split(
-        "\n"
-      )[0] || "video"
+async function rdGetTranscodedLinks(streamingId) {
+  try {
+    const response = await fetchURL(
+      `https://api.real-debrid.com/rest/1.0/streaming/transcode/${encodeURIComponent(streamingId)}`,
+      {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${RD_TOKEN}` },
+        timeout: 15000,
+      }
     );
 
-  const query =
-    uniqueTrackers
-      .map(
-        (tracker) =>
-          `&tr=${encodeURIComponent(
-            tracker
-          )}`
-      )
-      .join("");
+    if (response.status !== 200) {
+      console.warn(`   ⚠ transcode ${response.status} for ${streamingId}`);
+      return null;
+    }
 
-  return (
-    `magnet:?xt=urn:btih:${infoHash}` +
-    `&dn=${name}` +
-    query
-  );
+    return response.data;
+  } catch (err) {
+    console.warn(`   ⚠ transcode error: ${err.message}`);
+    return null;
+  }
 }
 
-function getTorrentScore(
-  item
-) {
-  const filename =
-    String(
-      item?.name ||
-      item?.title ||
-      ""
-    ).toLowerCase();
 
-  const isMP4 =
-    filename.includes(
-      ".mp4"
-    ) ||
-    filename.includes(
-      " mp4"
-    );
+function firstVideoTrack(mediaInfo) {
+  const videos = mediaInfo?.details?.video;
 
-  const isWebM =
-    filename.includes(
-      ".webm"
-    ) ||
-    filename.includes(
-      " webm"
-    );
+  if (!videos || typeof videos !== 'object') return null;
 
-  const isMKV =
-    filename.includes(
-      ".mkv"
-    ) ||
-    filename.includes(
-      " mkv"
-    ) ||
-    filename.includes(
-      "remux"
-    );
+  const first = Object.values(videos).find(v => v && typeof v === 'object');
 
-  const isH264 =
-    filename.includes(
-      "x264"
-    ) ||
-    filename.includes(
-      "h.264"
-    ) ||
-    filename.includes(
-      "h264"
-    ) ||
-    filename.includes(
-      "avc"
-    );
+  return first || null;
+}
 
-  const isHEVC =
-    filename.includes(
-      "hevc"
-    ) ||
-    filename.includes(
-      "h.265"
-    ) ||
-    filename.includes(
-      "h265"
-    ) ||
-    filename.includes(
-      "x265"
-    ) ||
-    filename.includes(
-      "av1"
-    );
+
+function firstAudioTrack(mediaInfo) {
+  const audios = mediaInfo?.details?.audio;
+
+  if (!audios || typeof audios !== 'object') return null;
+
+  const first = Object.values(audios).find(v => v && typeof v === 'object');
+
+  return first || null;
+}
+
+
+function normalizeCodec(codec) {
+  return String(codec || '').toLowerCase().replace(/[.\s_-]/g, '');
+}
+
+
+function getMediaContainer(filename, mimeType) {
+  const name = String(filename || '').toLowerCase();
+
+  if (name.endsWith('.mp4') || String(mimeType || '').includes('mp4')) return 'mp4';
+  if (name.endsWith('.webm') || String(mimeType || '').includes('webm')) return 'webm';
+  if (name.endsWith('.mkv') || String(mimeType || '').includes('matroska')) return 'mkv';
+  if (name.endsWith('.mov') || String(mimeType || '').includes('quicktime')) return 'mov';
+  if (name.endsWith('.avi') || String(mimeType || '').includes('avi')) return 'avi';
+
+  return 'unknown';
+}
+
+
+function isBrowserNativeMedia(mediaInfo, unrestricted) {
+  const filename = unrestricted?.filename || mediaInfo?.filename || '';
+  const mimeType = unrestricted?.mimeType || '';
+  const container = getMediaContainer(filename, mimeType);
+  const video = firstVideoTrack(mediaInfo);
+  const codec = normalizeCodec(video?.codec);
+
+  const h264 = codec === 'h264' || codec === 'avc' || codec.includes('avc1');
+  const vp8 = codec === 'vp8';
+  const vp9 = codec === 'vp9';
+
+  const mp4Native = container === 'mp4' && h264;
+  const webmNative = container === 'webm' && (vp8 || vp9 || h264);
+
+  return mp4Native || webmNative;
+}
+
+
+// Recursively extract URL strings from the transcoder response.
+// RD's documented schema exposes formats such as:
+// apple (M3U8/HLS), dash (MPD), liveMP4 and h264WebM.
+// The quality names/shape can vary, so do not assume arrays.
+function collectUrls(value, out = []) {
+  if (!value) return out;
+
+  if (typeof value === 'string') {
+    if (/^https?:\/\//i.test(value)) out.push(value);
+    return out;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) collectUrls(item, out);
+    return out;
+  }
+
+  if (typeof value === 'object') {
+    for (const item of Object.values(value)) {
+      collectUrls(item, out);
+    }
+  }
+
+  return out;
+}
+
+
+function pickBestTranscodeUrl(transcoded) {
+  if (!transcoded || typeof transcoded !== 'object') return null;
+
+  // HLS first. In RD API this is the "apple" format.
+  const hlsUrls = collectUrls(transcoded.apple);
+
+  if (hlsUrls.length) {
+    const full = hlsUrls.find(u => /full\.m3u8/i.test(u));
+    const m3u8 = hlsUrls.find(u => /\.m3u8(?:$|\?)/i.test(u));
+
+    return {
+      url: full || m3u8 || hlsUrls[0],
+      type: 'hls'
+    };
+  }
+
+  // Then live MP4.
+  const mp4Urls = collectUrls(transcoded.liveMP4);
+
+  if (mp4Urls.length) {
+    return {
+      url: mp4Urls[0],
+      type: 'mp4'
+    };
+  }
+
+  // Then H264 WebM.
+  const webmUrls = collectUrls(transcoded.h264WebM);
+
+  if (webmUrls.length) {
+    return {
+      url: webmUrls[0],
+      type: 'webm'
+    };
+  }
+
+  // Finally DASH.
+  const dashUrls = collectUrls(transcoded.dash);
+
+  if (dashUrls.length) {
+    const mpd = dashUrls.find(u => /\.mpd(?:$|\?)/i.test(u));
+
+    return {
+      url: mpd || dashUrls[0],
+      type: 'dash'
+    };
+  }
+
+  // Compatibility with older/alternate response shapes.
+  const legacyHls = collectUrls(transcoded.hls);
+
+  if (legacyHls.length) {
+    return {
+      url: legacyHls.find(u => /\.m3u8(?:$|\?)/i.test(u)) || legacyHls[0],
+      type: 'hls'
+    };
+  }
+
+  const legacyMp4 = collectUrls(transcoded.mp4);
+
+  if (legacyMp4.length) {
+    return {
+      url: legacyMp4[0],
+      type: 'mp4'
+    };
+  }
+
+  const legacyWebm = collectUrls(transcoded.webm);
+
+  if (legacyWebm.length) {
+    return {
+      url: legacyWebm[0],
+      type: 'webm'
+    };
+  }
+
+  return null;
+}
+
+
+function getNativeScore(mediaInfo, unrestricted) {
+  const filename = unrestricted?.filename || mediaInfo?.filename || '';
+  const mimeType = unrestricted?.mimeType || '';
+  const container = getMediaContainer(filename, mimeType);
+  const video = firstVideoTrack(mediaInfo);
+  const audio = firstAudioTrack(mediaInfo);
+
+  const codec = normalizeCodec(video?.codec);
+  const audioCodec = normalizeCodec(audio?.codec);
 
   let score = 0;
 
-  if (isMP4) {
-    score += 5000;
-  } else if (isWebM) {
-    score += 3500;
-  } else if (isMKV) {
-    score += 1000;
-  }
+  if (container === 'mp4') score += 5000;
+  else if (container === 'webm') score += 3000;
+  else if (container === 'mkv') score += 500;
+  else score -= 1000;
 
-  if (
-    isH264 &&
-    !isHEVC
-  ) {
+  if (codec === 'h264' || codec === 'avc' || codec.includes('avc1')) {
     score += 3000;
-  }
-
-  if (isHEVC) {
+  } else if (codec === 'vp9' || codec === 'vp8') {
+    score += container === 'webm' ? 2500 : 500;
+  } else if (
+    codec.includes('hevc') ||
+    codec.includes('h265') ||
+    codec.includes('x265') ||
+    codec.includes('av1')
+  ) {
     score -= 2500;
-  }
-
-  if (
-    filename.includes(
-      "2160p"
-    ) ||
-    filename.includes(
-      "4k"
-    ) ||
-    filename.includes(
-      "uhd"
-    )
-  ) {
-    score += 400;
-  } else if (
-    filename.includes(
-      "1080p"
-    ) ||
-    filename.includes(
-      "fhd"
-    )
-  ) {
-    score += 300;
-  } else if (
-    filename.includes(
-      "720p"
-    )
-  ) {
-    score += 200;
-  } else if (
-    filename.includes(
-      "480p"
-    )
-  ) {
-    score += 100;
-  }
-
-  if (
-    filename.includes(
-      "remux"
-    )
-  ) {
+  } else {
     score -= 1000;
   }
+
+  if (audioCodec === 'aac' || audioCodec.includes('mp3') || audioCodec.includes('opus')) {
+    score += 500;
+  }
+
+  const width = Number(video?.width || 0);
+  const height = Number(video?.height || 0);
+
+  if (width >= 3840 || height >= 2160) score += 400;
+  else if (width >= 1920 || height >= 1080) score += 300;
+  else if (width >= 1280 || height >= 720) score += 200;
 
   return score;
 }
 
-async function searchTorrentio(
-  imdbId,
-  type,
-  season,
-  episode
-) {
-  try {
-    let url;
 
-    if (
-      type === "movie"
-    ) {
-      url =
-        `${TORRENTIO_BASE}/stream/movie/${imdbId}.json`;
-    } else {
-      url =
-        `${TORRENTIO_BASE}/stream/series/${imdbId}:${season || 1}:${episode || 1}.json`;
-    }
+async function rdInspectLink(unrestrictedLink) {
+  if (!unrestrictedLink) return null;
 
-    console.log(
-      `   🔍 Torrentio: ${url.replace(
-        TORRENTIO_BASE,
-        ""
-      )}`
-    );
-
-    const response =
-      await fetchURL(
-        url,
-        {
-          timeout: 20000
-        }
-      );
-
-    if (
-      response.status !== 200
-    ) {
-      return [];
-    }
-
-    const streams =
-      response.data?.streams;
-
-    if (
-      !Array.isArray(streams) ||
-      streams.length === 0
-    ) {
-      return [];
-    }
-
-    const results = [];
-
-    for (
-      const stream of streams
-    ) {
-      if (
-        !stream.infoHash
-      ) {
-        continue;
-      }
-
-      const title =
-        stream.title ||
-        "";
-
-      const lower =
-        title.toLowerCase();
-
-      let quality = "?";
-
-      if (
-        lower.includes("2160p") ||
-        lower.includes("4k") ||
-        lower.includes("uhd")
-      ) {
-        quality = "4K";
-      } else if (
-        lower.includes("1080p")
-      ) {
-        quality = "1080p";
-      } else if (
-        lower.includes("720p")
-      ) {
-        quality = "720p";
-      } else if (
-        lower.includes("480p")
-      ) {
-        quality = "480p";
-      }
-
-      const sourceMatch =
-        title.match(
-          /⚙️\s*([^\n🇬🇧🇸🇦🇪🇸🇫🇷🇩🇪🇮🇹🇯🇵🇰🇷🇨🇳🇷🇺🇵🇹🇮🇳]+)/
-        );
-
-      const source =
-        sourceMatch
-          ? sourceMatch[1].trim()
-          : "torrentio";
-
-      const sizeMatch =
-        title.match(
-          /💾\s*([\d.]+\s*[GMK]B)/i
-        );
-
-      const sizeString =
-        sizeMatch
-          ? sizeMatch[1]
-          : "";
-
-      results.push({
-        name:
-          title.split(
-            "\n"
-          )[0] || title,
-
-        title,
-
-        magnet:
-          buildMagnet(
-            stream.infoHash,
-            title,
-            stream.sources ||
-              []
-          ),
-
-        quality,
-
-        size:
-          parseSize(
-            sizeString
-          ),
-
-        size_str:
-          sizeString,
-
-        seeds: 0,
-
-        source:
-          `torrentio-${source
-            .toLowerCase()
-            .replace(
-              /\s+/g,
-              ""
-            )}`,
-
-        infoHash:
-          stream.infoHash,
-
-        fileIdx:
-          stream.fileIdx ||
-          0
-      });
-    }
-
-    console.log(
-      `   ✅ Torrentio: ${results.length} نتيجة`
-    );
-
-    return results;
-  } catch (err) {
-    console.warn(
-      `   ⚠ Torrentio error: ${err.message}`
-    );
-
-    return [];
-  }
-}
-
-
-// ============================================================
-// REAL-DEBRID BASIC API
-// ============================================================
-
-async function rdAddMagnet(
-  magnet
-) {
-  try {
-    const response =
-      await fetchURL(
-        "https://api.real-debrid.com/rest/1.0/torrents/addMagnet",
-        {
-          method: "POST",
-
-          body:
-            `magnet=${encodeURIComponent(
-              magnet
-            )}`,
-
-          headers: {
-            "Content-Type":
-              "application/x-www-form-urlencoded",
-
-            Authorization:
-              `Bearer ${RD_TOKEN}`
-          },
-
-          timeout: 15000
-        }
-      );
-
-    if (
-      response.status === 200 ||
-      response.status === 201
-    ) {
-      return response.data;
-    }
-
-    console.warn(
-      `   ❌ RD addMagnet ${response.status}`,
-      response.data
-    );
-
-    return null;
-  } catch (err) {
-    console.warn(
-      `   ❌ RD addMagnet error: ${err.message}`
-    );
-
-    return null;
-  }
-}
-
-async function rdSelectFiles(
-  torrentId,
-  files = "all"
-) {
-  try {
-    const response =
-      await fetchURL(
-        `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${encodeURIComponent(
-          torrentId
-        )}`,
-        {
-          method: "POST",
-
-          body:
-            `files=${encodeURIComponent(
-              files
-            )}`,
-
-          headers: {
-            "Content-Type":
-              "application/x-www-form-urlencoded",
-
-            Authorization:
-              `Bearer ${RD_TOKEN}`
-          },
-
-          timeout: 10000
-        }
-      );
-
-    return (
-      response.status === 200 ||
-      response.status === 204
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function rdGetTorrentInfo(
-  torrentId
-) {
-  try {
-    const response =
-      await fetchURL(
-        `https://api.real-debrid.com/rest/1.0/torrents/info/${encodeURIComponent(
-          torrentId
-        )}`,
-        {
-          headers: {
-            Authorization:
-              `Bearer ${RD_TOKEN}`
-          },
-
-          timeout: 10000
-        }
-      );
-
-    return response.status === 200
-      ? response.data
-      : null;
-  } catch {
-    return null;
-  }
-}
-
-async function rdWaitForTorrent(
-  torrentId,
-  maxWaitMs = 240000
-) {
-  const start =
-    Date.now();
-
-  while (
-    Date.now() -
-      start <
-    maxWaitMs
-  ) {
-    const info =
-      await rdGetTorrentInfo(
-        torrentId
-      );
-
-    if (info) {
-      if (
-        info.status ===
-        "downloaded"
-      ) {
-        return info;
-      }
-
-      if (
-        info.status ===
-        "waiting_files_selection"
-      ) {
-        await rdSelectFiles(
-          torrentId,
-          "all"
-        );
-      }
-
-      if (
-        [
-          "error",
-          "magnet_error",
-          "virus",
-          "dead"
-        ].includes(
-          info.status
-        )
-      ) {
-        return null;
-      }
-    }
-
-    await sleep(3000);
-  }
-
-  return null;
-}
-
-async function rdUnrestrict(
-  link
-) {
-  try {
-    const response =
-      await fetchURL(
-        "https://api.real-debrid.com/rest/1.0/unrestrict/link",
-        {
-          method: "POST",
-
-          body:
-            `link=${encodeURIComponent(
-              link
-            )}`,
-
-          headers: {
-            "Content-Type":
-              "application/x-www-form-urlencoded",
-
-            Authorization:
-              `Bearer ${RD_TOKEN}`
-          },
-
-          timeout: 15000
-        }
-      );
-
-    if (
-      response.status === 200 ||
-      response.status === 201
-    ) {
-      return response.data;
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-
-// ============================================================
-// MEDIA INFO
-// ============================================================
-
-async function rdGetMediaInfos(
-  streamingId
-) {
-  try {
-    const response =
-      await fetchURL(
-        `https://api.real-debrid.com/rest/1.0/streaming/mediaInfos/${encodeURIComponent(
-          streamingId
-        )}`,
-        {
-          headers: {
-            Authorization:
-              `Bearer ${RD_TOKEN}`
-          },
-
-          timeout: 15000
-        }
-      );
-
-    if (
-      response.status !== 200
-    ) {
-      console.warn(
-        `   ⚠ mediaInfos ${response.status}`,
-        response.data
-      );
-
-      return null;
-    }
-
-    return response.data;
-  } catch (err) {
-    console.warn(
-      `   ⚠ mediaInfos error: ${err.message}`
-    );
-
-    return null;
-  }
-}
-
-
-// ============================================================
-// TRANSCODE
-// ============================================================
-
-async function rdGetTranscodedLinks(
-  streamingId
-) {
-  try {
-    const response =
-      await fetchURL(
-        `https://api.real-debrid.com/rest/1.0/streaming/transcode/${encodeURIComponent(
-          streamingId
-        )}`,
-        {
-          headers: {
-            Authorization:
-              `Bearer ${RD_TOKEN}`
-          },
-
-          timeout: 15000
-        }
-      );
-
-    if (
-      response.status !== 200
-    ) {
-      console.warn(
-        `   ⚠ transcode ${response.status}`,
-        response.data
-      );
-
-      return null;
-    }
-
-    return response.data;
-  } catch (err) {
-    console.warn(
-      `   ⚠ transcode error: ${err.message}`
-    );
-
-    return null;
-  }
-}
-
-
-// ============================================================
-// URL EXTRACTOR
-// ============================================================
-
-function collectURLs(
-  value,
-  output = []
-) {
-  if (!value) {
-    return output;
-  }
-
-  if (
-    typeof value ===
-    "string"
-  ) {
-    if (
-      /^https?:\/\//i.test(
-        value
-      )
-    ) {
-      output.push(value);
-    }
-
-    return output;
-  }
-
-  if (
-    Array.isArray(value)
-  ) {
-    for (
-      const item of value
-    ) {
-      collectURLs(
-        item,
-        output
-      );
-    }
-
-    return output;
-  }
-
-  if (
-    typeof value ===
-    "object"
-  ) {
-    for (
-      const item of Object.values(
-        value
-      )
-    ) {
-      collectURLs(
-        item,
-        output
-      );
-    }
-  }
-
-  return output;
-}
-
-
-// ============================================================
-// BEST TRANSCODE
-// ============================================================
-
-function pickBestTranscode(
-  data
-) {
-  if (!data) {
+  const data = await rdUnrestrict(unrestrictedLink);
+  if (!data?.download) {
     return null;
   }
 
-  // HLS first
+  const filename = String(data.filename || "");
+  const mimeType = String(data.mimeType || "");
+  const lowerName = filename.toLowerCase();
 
-  const hls =
-    collectURLs(
-      data.apple
-    );
-
-  if (
-    hls.length
-  ) {
-    return {
-      url:
-        hls.find(
-          (url) =>
-            /\.m3u8(?:$|\?)/i.test(
-              url
-            )
-        ) ||
-        hls[0],
-
-      type:
-        "hls"
-    };
+  let mediaInfo = null;
+  if (data.id) {
+    mediaInfo = await rdGetMediaInfos(data.id);
   }
 
-  // Live MP4
+  const video = firstVideoTrack(mediaInfo);
+  const codec = String(video?.codec || "").toLowerCase();
+  const container = getMediaContainer(filename, mimeType);
 
-  const mp4 =
-    collectURLs(
-      data.liveMP4
-    );
+  const looksHevc =
+    lowerName.includes("hevc") ||
+    lowerName.includes("h.265") ||
+    lowerName.includes("h265") ||
+    lowerName.includes("x265") ||
+    lowerName.includes("av1") ||
+    codec.includes("hevc") ||
+    codec.includes("h265") ||
+    codec.includes("x265") ||
+    codec.includes("av1");
 
-  if (
-    mp4.length
-  ) {
-    return {
-      url:
-        mp4[0],
-
-      type:
-        "mp4"
-    };
-  }
-
-  // H264 WebM
-
-  const webm =
-    collectURLs(
-      data.h264WebM
-    );
-
-  if (
-    webm.length
-  ) {
-    return {
-      url:
-        webm[0],
-
-      type:
-        "webm"
-    };
-  }
-
-  // DASH
-
-  const dash =
-    collectURLs(
-      data.dash
-    );
-
-  if (
-    dash.length
-  ) {
-    return {
-      url:
-        dash.find(
-          (url) =>
-            /\.mpd(?:$|\?)/i.test(
-              url
-            )
-        ) ||
-        dash[0],
-
-      type:
-        "dash"
-    };
-  }
-
-  // Legacy HLS
-
-  const oldHLS =
-    collectURLs(
-      data.hls
-    );
-
-  if (
-    oldHLS.length
-  ) {
-    return {
-      url:
-        oldHLS.find(
-          (url) =>
-            /\.m3u8(?:$|\?)/i.test(
-              url
-            )
-        ) ||
-        oldHLS[0],
-
-      type:
-        "hls"
-    };
-  }
-
-  // Legacy MP4
-
-  const oldMP4 =
-    collectURLs(
-      data.mp4
-    );
-
-  if (
-    oldMP4.length
-  ) {
-    return {
-      url:
-        oldMP4[0],
-
-      type:
-        "mp4"
-    };
-  }
-
-  // Legacy WebM
-
-  const oldWebM =
-    collectURLs(
-      data.webm
-    );
-
-  if (
-    oldWebM.length
-  ) {
-    return {
-      url:
-        oldWebM[0],
-
-      type:
-        "webm"
-    };
-  }
-
-  return null;
-}
-
-
-// ============================================================
-// MEDIA HELPERS
-// ============================================================
-
-function getContainer(
-  filename,
-  mimeType
-) {
-  const name =
-    String(
-      filename || ""
-    ).toLowerCase();
-
-  const mime =
-    String(
-      mimeType || ""
-    ).toLowerCase();
-
-  if (
-    name.endsWith(".mp4") ||
-    mime.includes(
-      "video/mp4"
-    )
-  ) {
-    return "mp4";
-  }
-
-  if (
-    name.endsWith(".webm") ||
-    mime.includes(
-      "video/webm"
-    )
-  ) {
-    return "webm";
-  }
-
-  if (
-    name.endsWith(".mkv") ||
-    mime.includes(
-      "matroska"
-    )
-  ) {
-    return "mkv";
-  }
-
-  return "unknown";
-}
-
-function isStreamable(
-  value
-) {
-  return (
-    value === true ||
-    Number(value) === 1 ||
-    String(
-      value
-    ).toLowerCase() ===
-      "true"
-  );
-}
-
-function looksHEVC(
-  filename,
-  mediaInfo
-) {
-  const filenameText =
-    String(
-      filename || ""
-    ).toLowerCase();
-
-  const codec =
-    String(
-      mediaInfo?.codec ||
-        ""
-    ).toLowerCase();
-
-  return (
-    /hevc|h\.265|h265|x265|av1/.test(
-      filenameText
-    ) ||
-    /hevc|h265|x265|av1/.test(
-      codec
-    )
-  );
-}
-
-function looksH264(
-  filename,
-  mediaInfo
-) {
-  const filenameText =
-    String(
-      filename || ""
-    ).toLowerCase();
-
-  const codec =
-    String(
-      mediaInfo?.codec ||
-        ""
-    ).toLowerCase();
-
-  return (
-    /x264|h\.264|h264|avc/.test(
-      filenameText
-    ) ||
-    /h264|avc/.test(
-      codec
-    )
-  );
-}
-
-
-// ============================================================
-// SINGLE LINK INSPECTION
-// ============================================================
-
-async function inspectRDLink(
-  link
-) {
-  const unrestricted =
-    await rdUnrestrict(
-      link
-    );
-
-  if (
-    !unrestricted?.download
-  ) {
-    return null;
-  }
-
-  const mediaInfo =
-    unrestricted.id
-      ? await rdGetMediaInfos(
-          unrestricted.id
-        )
-      : null;
-
-  const filename =
-    unrestricted.filename ||
-    "";
-
-  const mimeType =
-    unrestricted.mimeType ||
-    "";
-
-  const container =
-    getContainer(
-      filename,
-      mimeType
-    );
-
-  const hevc =
-    looksHEVC(
-      filename,
-      mediaInfo
-    );
-
-  const h264 =
-    looksH264(
-      filename,
-      mediaInfo
-    );
+  const h264Like =
+    lowerName.includes("x264") ||
+    lowerName.includes("h.264") ||
+    lowerName.includes("h264") ||
+    lowerName.includes("avc") ||
+    codec.includes("h264") ||
+    codec.includes("avc");
 
   const streamable =
-    isStreamable(
-      unrestricted.streamable
-    );
+    data.streamable === true ||
+    Number(data.streamable) === 1 ||
+    String(data.streamable).toLowerCase() === "true";
 
-  const nativeMP4 =
-    container === "mp4" &&
+  const filenameLooksMp4 =
+    lowerName.endsWith(".mp4") ||
+    mimeType.toLowerCase().includes("video/mp4");
+
+  const filenameLooksWebm =
+    lowerName.endsWith(".webm") ||
+    mimeType.toLowerCase().includes("video/webm");
+
+  const nativeBrowser =
     streamable &&
-    !hevc;
-
-  const nativeWebM =
-    container === "webm" &&
-    streamable &&
-    !hevc;
-
-  let score = 0;
-
-  if (
-    container === "mp4"
-  ) {
-    score += 5000;
-  } else if (
-    container === "webm"
-  ) {
-    score += 3500;
-  } else if (
-    container === "mkv"
-  ) {
-    score += 1000;
-  }
-
-  if (
-    h264 &&
-    !hevc
-  ) {
-    score += 3000;
-  }
-
-  if (hevc) {
-    score -= 2500;
-  }
-
-  if (streamable) {
-    score += 1000;
-  }
-
-  if (
-    nativeMP4
-  ) {
-    score += 2500;
-  }
-
-  if (
-    nativeWebM
-  ) {
-    score += 1500;
-  }
+    !looksHevc &&
+    (filenameLooksMp4 || filenameLooksWebm) &&
+    (h264Like || !mediaInfo || !codec);
 
   return {
-    ...unrestricted,
-
-    link,
-
-    mediaInfo,
-
+    ...data,
     filename,
-
     mimeType,
-
+    mediaInfo,
+    video,
+    codec,
     container,
-
-    hevc,
-
-    h264,
-
+    looksHevc,
+    h264Like,
     streamable,
-
-    score
+    filenameLooksMp4,
+    filenameLooksWebm,
+    nativeBrowser,
+    link: unrestrictedLink,
   };
 }
 
+async function rdGetPlayableUrlFromInspection(info) {
+  if (!info?.download) return null;
 
-// ============================================================
-// GET PLAYABLE URL FROM ONE LINK
-// ============================================================
+  // 1) Ask RD for transcoding first.
+  // HLS is preferred because it works well with the existing web player.
+  if (info.id) {
+    const transcoded = await rdGetTranscodedLinks(info.id);
+    const transcodedPlayable = pickBestTranscodeUrl(transcoded);
 
-async function getPlayableFromInspected(
-  info
-) {
-  if (
-    !info?.download
-  ) {
-    return null;
-  }
-
-  // ----------------------------------------------------------
-  // First: try HLS / transcode
-  // ----------------------------------------------------------
-
-  if (
-    info.id
-  ) {
-    const transcoded =
-      await rdGetTranscodedLinks(
-        info.id
-      );
-
-    const transcodedResult =
-      pickBestTranscode(
-        transcoded
-      );
-
-    if (
-      transcodedResult?.url
-    ) {
-      console.log(
-        `   🎬 RD transcode: ${transcodedResult.type}`
-      );
+    if (transcodedPlayable?.url) {
+      console.log(`   🎬 RD transcode: ${transcodedPlayable.type}`);
 
       return {
-        url:
-          transcodedResult.url,
-
-        type:
-          transcodedResult.type,
-
-        link:
-          info.link,
-
-        filename:
-          info.filename,
-
-        filesize:
-          Number(
-            info.filesize || 0
-          ),
-
-        mimeType:
-          info.mimeType ||
-          null,
-
-        mediaInfo:
-          info.mediaInfo ||
-          null,
-
-        streamingId:
-          info.id
+        url: transcodedPlayable.url,
+        type: transcodedPlayable.type,
+        formats: transcoded,
+        mediaInfo: info.mediaInfo,
+        streamingId: info.id,
+        filename: info.filename,
+        filesize: Number(info.filesize || 0),
+        mimeType: info.mimeType || null,
+        native: false,
+        link: info.link,
       };
     }
   }
 
-  // ----------------------------------------------------------
-  // Second: native stream
-  // ----------------------------------------------------------
-
-  if (
-    info.streamable &&
-    info.container ===
-      "mp4" &&
-    !info.hevc
-  ) {
+  // 2) No transcode: native MP4/WebM is perfectly valid for streaming.
+  // mediaInfos is optional and a 400 must NOT kill a valid MP4.
+  if (info.nativeBrowser) {
     console.log(
-      `   ✅ Native MP4: ${info.filename}`
+      `   ✅ Native stream: ${info.filename} | ${info.mimeType || "unknown"}`
     );
 
     return {
-      url:
-        info.download,
-
-      type:
-        "mp4",
-
-      link:
-        info.link,
-
-      filename:
-        info.filename,
-
-      filesize:
-        Number(
-          info.filesize || 0
-        ),
-
-      mimeType:
-        info.mimeType ||
-        "video/mp4",
-
-      mediaInfo:
-        info.mediaInfo ||
-        null,
-
-      streamingId:
-        info.id ||
-        null
+      url: info.download,
+      type: info.filenameLooksWebm ? "webm" : "mp4",
+      formats: null,
+      mediaInfo: info.mediaInfo,
+      streamingId: info.id || null,
+      filename: info.filename,
+      filesize: Number(info.filesize || 0),
+      mimeType: info.mimeType || null,
+      native: true,
+      link: info.link,
     };
   }
 
+  // 3) If RD explicitly says it is streamable and the name is MP4,
+  // allow it even when mediaInfos/transcode are unavailable.
   if (
     info.streamable &&
-    info.container ===
-      "webm" &&
-    !info.hevc
-  ) {
-    console.log(
-      `   ✅ Native WebM: ${info.filename}`
-    );
-
-    return {
-      url:
-        info.download,
-
-      type:
-        "webm",
-
-      link:
-        info.link,
-
-      filename:
-        info.filename,
-
-      filesize:
-        Number(
-          info.filesize || 0
-        ),
-
-      mimeType:
-        info.mimeType ||
-        "video/webm",
-
-      mediaInfo:
-        info.mediaInfo ||
-        null,
-
-      streamingId:
-        info.id ||
-        null
-    };
-  }
-
-  // ----------------------------------------------------------
-  // Third: MP4 fallback even if mediaInfos failed
-  // ----------------------------------------------------------
-
-  if (
-    info.container ===
-      "mp4" &&
-    info.streamable &&
-    !info.hevc
+    info.filenameLooksMp4 &&
+    !info.looksHevc
   ) {
     console.log(
       `   ✅ Streamable MP4 fallback: ${info.filename}`
     );
 
     return {
-      url:
-        info.download,
-
-      type:
-        "mp4",
-
-      link:
-        info.link,
-
-      filename:
-        info.filename,
-
-      filesize:
-        Number(
-          info.filesize || 0
-        ),
-
-      mimeType:
-        info.mimeType ||
-        "video/mp4",
-
-      mediaInfo:
-        info.mediaInfo ||
-        null,
-
-      streamingId:
-        info.id ||
-        null
+      url: info.download,
+      type: "mp4",
+      formats: null,
+      mediaInfo: info.mediaInfo,
+      streamingId: info.id || null,
+      filename: info.filename,
+      filesize: Number(info.filesize || 0),
+      mimeType: info.mimeType || "video/mp4",
+      native: true,
+      link: info.link,
     };
   }
+
+  console.warn(
+    `   ❌ No playable stream for ${info.filename || "unknown file"} (${info.container}/${info.codec || "unknown"})`
+  );
 
   return null;
 }
 
-async function rdGetPlayableUrl(link) {
-  if (!link) {
-    return null;
-  }
-
-  const inspected =
-    await inspectRDLink(link);
-
-  if (!inspected) {
-    return null;
-  }
-
-  return await getPlayableFromInspected(
-    inspected
-  );
+async function rdGetPlayableUrl(unrestrictedLink) {
+  const info = await rdInspectLink(unrestrictedLink);
+  if (!info) return null;
+  return rdGetPlayableUrlFromInspection(info);
 }
-// ============================================================
-// FIND BEST PLAYABLE FILE
-// ============================================================
 
-async function rdResolveBestPlayableLink(
-  torrentInfo
-) {
-  const links =
-    Array.isArray(
-      torrentInfo?.links
-    )
-      ? torrentInfo.links
-      : [];
+function browserFileScore(info) {
+  if (!info) return -10000;
 
-  const files =
-    Array.isArray(
-      torrentInfo?.files
-    )
-      ? torrentInfo.files
-      : [];
+  const name = String(info.filename || "").toLowerCase();
+  const codec = String(info.codec || "").toLowerCase();
 
-  if (
-    links.length === 0
-  ) {
-    return null;
-  }
+  let score = 0;
+
+  const isMp4 = info.filenameLooksMp4;
+  const isWebm = info.filenameLooksWebm;
+  const isMkv = info.container === "mkv" || name.endsWith(".mkv");
+  const hevc = info.looksHevc;
+  const h264 = info.h264Like;
+
+  if (isMp4) score += 5000;
+  else if (isWebm) score += 3500;
+  else if (isMkv) score += 1000;
+  else score -= 1000;
+
+  if (h264 && !hevc) score += 3000;
+  else if (!hevc && (codec.includes("vp9") || codec.includes("vp8"))) score += 2200;
+  else if (hevc) score -= 2500;
+  else score += 100;
+
+  if (info.nativeBrowser) score += 2500;
+  if (info.streamable) score += 1000;
+
+  const width = Number(info.video?.width || 0);
+  const height = Number(info.video?.height || 0);
+
+  if (width >= 3840 || height >= 2160) score += 400;
+  else if (width >= 1920 || height >= 1080) score += 300;
+  else if (width >= 1280 || height >= 720) score += 200;
+
+  return score;
+}
+
+// Inspect all returned RD links. mediaInfos is optional: if it returns 400,
+// filename/mimeType/streamable from unrestrict are still enough to recognize
+// a directly streamable MP4/WebM.
+async function rdFindBestPlayableLink(torrentInfo) {
+  const links = Array.isArray(torrentInfo?.links)
+    ? torrentInfo.links
+    : [];
+
+  if (!links.length) return null;
+
+  const files = Array.isArray(torrentInfo?.files)
+    ? torrentInfo.files
+    : [];
 
   const candidates = [];
 
-  for (
-    let index = 0;
-    index < links.length;
-    index++
-  ) {
+  for (let i = 0; i < links.length; i++) {
+    const link = links[i];
+
     try {
-      const info =
-        await inspectRDLink(
-          links[index]
-        );
+      const info = await rdInspectLink(link);
 
       if (!info) {
+        console.log(`   ⚠ Link ${i + 1}: unrestrict failed`);
         continue;
       }
 
-      if (
-        !info.filename &&
-        files[index]?.path
-      ) {
-        info.filename =
-          files[index].path;
+      const fileMeta = files[i] || {};
+
+      if (!info.filename && fileMeta.path) {
+        info.filename = fileMeta.path;
       }
 
-      const fileSize =
-        Number(
-          info.filesize ||
-            files[index]?.bytes ||
-            0
-        );
+      const size = Number(
+        info.filesize ||
+        fileMeta.bytes ||
+        0
+      );
+
+      const score = browserFileScore(info);
 
       candidates.push({
+        link,
         info,
-
-        link:
-          links[index],
-
-        size:
-          fileSize,
-
-        score:
-          info.score
+        filename: info.filename || fileMeta.path || torrentInfo.filename || "",
+        score,
+        size,
+        index: i,
       });
 
       console.log(
-        `   🔎 [${index + 1}/${links.length}] ${info.filename || "unknown"} | ${info.mimeType || "?"} | score ${info.score}`
+        `   🔎 [${i + 1}/${links.length}] ${
+          info.filename || fileMeta.path || torrentInfo.filename || "unknown"
+        } | ${info.codec || "?"} | ${info.video?.width || "?"}x${
+          info.video?.height || "?"
+        } | ${info.mimeType || "?"} | score ${score}`
       );
     } catch (err) {
       console.warn(
-        `   ⚠ inspect link ${index + 1} failed: ${err.message}`
+        `   ⚠ Link inspection failed: ${err.message}`
       );
     }
   }
 
-  candidates.sort(
-    (a, b) =>
-      (b.score - a.score) ||
-      (b.size - a.size)
-  );
+  if (!candidates.length) return null;
 
-  for (
-    const candidate of candidates
-  ) {
-    const playable =
-      await getPlayableFromInspected(
-        candidate.info
-      );
+  candidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return b.size - a.size;
+  });
 
-    if (
-      playable?.url
-    ) {
+  // The first candidate may not have a playable transcode. Try candidates
+  // in score order until one actually produces HLS/MP4/WebM/native playback.
+  for (const candidate of candidates) {
+    const playable = await rdGetPlayableUrlFromInspection(candidate.info);
+
+    if (playable?.url) {
       return {
         ...playable,
-
-        link:
-          candidate.link,
-
+        link: candidate.link,
+        filename:
+          playable.filename ||
+          candidate.filename ||
+          torrentInfo.filename,
         filesize:
           playable.filesize ||
-          candidate.size
+          candidate.size ||
+          0,
+        mediaInfo:
+          playable.mediaInfo ||
+          candidate.info.mediaInfo ||
+          null,
       };
     }
   }
@@ -1832,1783 +1171,885 @@ async function rdResolveBestPlayableLink(
   return null;
 }
 
+async function rdResolveBestPlayableLink(torrentInfo) {
+  const playable = await rdFindBestPlayableLink(torrentInfo);
 
-// ============================================================
-// STREAM URL HELPERS
-// ============================================================
-
-function buildLocalStreamURL(
-  {
-    id,
-    type,
-    season,
-    episode
-  }
-) {
-  const params =
-    new URLSearchParams();
-
-  params.set(
-    "id",
-    String(id)
-  );
-
-  params.set(
-    "type",
-    String(type)
-  );
-
-  if (
-    type === "tv"
-  ) {
-    params.set(
-      "season",
-      String(
-        season || 1
-      )
+  if (!playable) {
+    console.log(
+      "   ❌ No browser-compatible stream found in this torrent"
     );
 
-    params.set(
-      "episode",
-      String(
-        episode || 1
-      )
-    );
-  }
-
-  return (
-    `/api/stream?${params.toString()}`
-  );
-}
-
-function getAbsoluteAPIUrl(
-  req,
-  relativeURL
-) {
-  if (
-    !relativeURL
-  ) {
-    return relativeURL;
-  }
-
-  if (
-    /^https?:\/\//i.test(
-      relativeURL
-    )
-  ) {
-    return relativeURL;
-  }
-
-  const forwardedProto =
-    req.headers[
-      "x-forwarded-proto"
-    ];
-
-  const forwardedHost =
-    req.headers[
-      "x-forwarded-host"
-    ];
-
-  const protocol =
-    forwardedProto
-      ? String(
-          forwardedProto
-        )
-          .split(",")[0]
-          .trim()
-      : (
-          req.protocol ||
-          "https"
-        );
-
-  const host =
-    forwardedHost
-      ? String(
-          forwardedHost
-        )
-          .split(",")[0]
-          .trim()
-      : req.get("host");
-
-  return (
-    `${protocol}://${host}${relativeURL}`
-  );
-}
-
-
-// ============================================================
-// CACHE PLAYBACK RESOLVER
-// ============================================================
-
-async function resolveCachedPlayback(
-  {
-    id,
-    type,
-    season,
-    episode
-  }
-) {
-  const cached =
-    await cache.getCache(
-      id,
-      type,
-      season,
-      episode
-    );
-
-  if (
-    !cached?.hit ||
-    !cached.data
-  ) {
     return null;
   }
 
-  let playable =
-    null;
+  console.log(
+    `   🎯 Selected: ${playable.filename} | ${playable.type}`
+  );
 
-  // Always generate a fresh RD URL.
+  return playable;
+}
 
-  if (
-    cached.data.rd_link
-  ) {
-    playable =
-      await rdGetPlayableUrl(
-        cached.data.rd_link
-      );
+function makeStreamProxyUrl({ id, type, season, episode }) {
+  const params = new URLSearchParams();
+  params.set("id", String(id));
+  params.set("type", String(type));
+
+  if (type === "tv") {
+    params.set("season", String(season || 1));
+    params.set("episode", String(episode || 1));
   }
 
-  // If old RD link no longer works,
-  // use the RD torrent again.
+  return `/api/stream?${params.toString()}`;
+}
 
-  if (
-    !playable?.url &&
-    cached.data.rd_torrent_id
-  ) {
-    const info =
-      await rdGetTorrentInfo(
-        cached.data.rd_torrent_id
-      );
+async function resolveCachedPlayback({ id, type, season, episode }) {
+  const cached = await cache.getCache(
+    id,
+    type,
+    season,
+    episode
+  );
 
-    if (
-      info?.status ===
-        "downloaded" &&
-      info.links?.length
-    ) {
-      playable =
-        await rdResolveBestPlayableLink(
-          info
-        );
+  if (!cached?.hit || !cached.data) {
+    return null;
+  }
+
+  let playable = null;
+
+  if (cached.data.rd_link) {
+    playable = await rdGetPlayableUrl(cached.data.rd_link);
+  }
+
+  if (!playable?.url && cached.data.rd_torrent_id) {
+    const info = await rdGetTorrentInfo(
+      cached.data.rd_torrent_id
+    );
+
+    if (info?.status === "downloaded" && info.links?.length) {
+      playable = await rdResolveBestPlayableLink(info);
     }
   }
 
-  if (
-    !playable?.url
-  ) {
+  if (!playable?.url) {
     return null;
   }
 
   return {
     playable,
-
-    cached
+    cached,
   };
 }
 
+// =============================================================
 
-// ============================================================
 // OPENSUBTITLES
-// ============================================================
 
-async function searchOpenSubtitles(
-  {
-    tmdbId,
-    type,
-    season,
-    episode,
-    title,
-    year
-  }
-) {
-  if (
-    !OS_API_KEY
-  ) {
-    return null;
-  }
+// =============================================================
+
+
+async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year }) {
+
+  if (!OS_API_KEY) return null;
 
   try {
-    let searchURL;
 
-    if (
-      tmdbId
-    ) {
-      const tmdbQuery =
-        type === "movie"
-          ? `tmdb_id=${tmdbId}`
-          : `tmdb_id=${tmdbId}&season_number=${season || 1}&episode_number=${episode || 1}`;
+    let searchUrl;
 
-      searchURL =
-        `${OS_BASE}/subtitles?${tmdbQuery}` +
-        `&languages=ar` +
-        `&order_by=download_count` +
-        `&order_direction=desc`;
-    } else if (
-      title
-    ) {
-      searchURL =
-        `${OS_BASE}/subtitles?query=${encodeURIComponent(
-          year
-            ? `${title} ${year}`
-            : title
-        )}` +
-        `&languages=ar` +
-        `&order_by=download_count` +
-        `&order_direction=desc`;
+    if (tmdbId) {
+
+      const tmdbParam = type === 'movie'
+
+        ? `tmdb_id=${tmdbId}`
+
+        : `tmdb_id=${tmdbId}&season_number=${season || 1}&episode_number=${episode || 1}`;
+
+      searchUrl = `${OS_BASE}/subtitles?${tmdbParam}&languages=ar&order_by=download_count&order_direction=desc`;
+
+    } else if (title) {
+
+      const query = encodeURIComponent(year ? `${title} ${year}` : title);
+
+      searchUrl = `${OS_BASE}/subtitles?query=${query}&languages=ar&order_by=download_count&order_direction=desc`;
+
     } else {
+
       return null;
+
     }
 
-    const search =
-      await fetchURL(
-        searchURL,
-        {
-          headers: {
-            "Api-Key":
-              OS_API_KEY,
 
-            "User-Agent":
-              "BlueStream v1.0",
+    const searchRes = await fetchURL(searchUrl, {
 
-            Accept:
-              "application/json"
-          },
+      headers: {
 
-          timeout: 12000
-        }
-      );
+        'Api-Key': OS_API_KEY,
 
-    if (
-      search.status !== 200 ||
-      !search.data?.data?.length
-    ) {
-      return null;
-    }
+        'User-Agent': 'BlueStream v1.0',
 
-    const candidate =
-      search.data.data.find(
-        (item) =>
-          item.attributes
-            ?.language === "ar"
-      );
+        'Accept': 'application/json',
 
-    if (!candidate) {
-      return null;
-    }
+      },
 
-    const fileId =
-      candidate.attributes
-        ?.files?.[0]
-        ?.file_id;
+      timeout: 12000,
 
-    if (!fileId) {
-      return null;
-    }
+    });
 
-    const download =
-      await fetchURL(
-        `${OS_BASE}/download`,
-        {
-          method: "POST",
 
-          headers: {
-            "Api-Key":
-              OS_API_KEY,
+    if (searchRes.status !== 200 || !searchRes.data?.data?.length) return null;
 
-            "User-Agent":
-              "BlueStream v1.0",
+    const candidates = searchRes.data.data.filter(s => s.attributes?.language === 'ar');
 
-            "Content-Type":
-              "application/json",
+    if (!candidates.length) return null;
 
-            Accept:
-              "application/json"
-          },
 
-          body:
-            JSON.stringify({
-              file_id:
-                fileId,
+    const top = candidates[0];
 
-              sub_format:
-                "srt"
-            }),
+    const fileId = top.attributes?.files?.[0]?.file_id;
 
-          timeout: 15000
-        }
-      );
+    if (!fileId) return null;
 
-    if (
-      download.status !==
-        200 ||
-      !download.data?.link
-    ) {
-      return null;
-    }
 
-    const subtitleResponse =
-      await fetchURL(
-        download.data.link,
-        {
-          timeout: 15000
-        }
-      );
+    const dlRes = await fetchURL(`${OS_BASE}/download`, {
 
-    if (
-      subtitleResponse.status !==
-        200 ||
-      !subtitleResponse.data
-    ) {
-      return null;
-    }
+      method: 'POST',
 
-    const content =
-      typeof subtitleResponse.data ===
-      "string"
-        ? subtitleResponse.data
-        : String(
-            subtitleResponse.data
-          );
+      headers: {
 
-    const base64 =
-      Buffer
-        .from(
-          content,
-          "utf8"
-        )
-        .toString(
-          "base64"
-        );
+        'Api-Key': OS_API_KEY,
+
+        'User-Agent': 'BlueStream v1.0',
+
+        'Content-Type': 'application/json',
+
+        'Accept': 'application/json',
+
+      },
+
+      body: JSON.stringify({ file_id: fileId, sub_format: 'srt' }),
+
+      timeout: 15000,
+
+    });
+
+
+    if (dlRes.status !== 200 || !dlRes.data?.link) return null;
+
+    const srtRes = await fetchURL(dlRes.data.link, { timeout: 15000 });
+
+    if (srtRes.status !== 200 || !srtRes.data) return null;
+
+
+    const srtContent = typeof srtRes.data === 'string' ? srtRes.data : String(srtRes.data);
+
+    const srtBase64 = Buffer.from(srtContent, 'utf8').toString('base64');
+
+    const dataUrl = `data:text/plain;charset=utf-8;base64,${srtBase64}`;
+
 
     return {
-      url:
-        `data:text/plain;charset=utf-8;base64,${base64}`,
 
-      language:
-        "ar",
+      url: dataUrl, language: 'ar', label: 'العربية',
 
-      label:
-        "العربية",
+      source: 'opensubtitles', release: top.attributes?.release || '',
 
-      source:
-        "opensubtitles",
-
-      release:
-        candidate.attributes
-          ?.release ||
-        ""
     };
+
   } catch (err) {
-    console.warn(
-      "OS error:",
-      err.message
-    );
+
+    console.warn('OS error:', err.message);
 
     return null;
+
   }
+
 }
 
 
-// ============================================================
-// CORE PLAY
-// ============================================================
+// =============================================================
 
-async function tryGetStream(
-  {
-    id,
-    type,
-    sNum,
-    eNum,
-    withSubs
-  }
-) {
-  // ----------------------------------------------------------
-  // CACHE FIRST
-  // ----------------------------------------------------------
+// CORE
 
-  const cached =
-    await resolveCachedPlayback(
-      {
-        id,
+// =============================================================
+
+
+async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
+
+  // 1) Cache
+
+  const cached = await cache.getCache(id, type, sNum, eNum);
+
+
+  if (cached.hit && cached.fresh) {
+    // Never trust a previously cached RD playback URL.
+    // Re-unrestrict the original RD link so the player receives a fresh URL.
+    let playable = null;
+
+    if (cached.data?.rd_link) {
+      playable = await rdGetPlayableUrl(cached.data.rd_link);
+    }
+
+    if (playable?.url) {
+      const subtitle = withSubs ? await searchOpenSubtitles({
+        tmdbId: parseInt(id),
         type,
-        season:
-          sNum,
-        episode:
-          eNum
+        season: sNum,
+        episode: eNum,
+        title: cached.data.title,
+        year: cached.data.year,
+      }) : null;
+
+      return {
+        success: true,
+        provider: `real-debrid+${cached.data.source || 'cache'}`,
+        quality: cached.data.quality,
+        title: cached.data.title,
+        year: cached.data.year,
+        filename: playable.filename || cached.data.filename,
+        stream_url: playable.type === "mp4" ? makeStreamProxyUrl({ id, type, season: sNum, episode: eNum }) : playable.url,
+        stream_type: playable.type === "mp4" ? "mp4-proxy" : playable.type,
+        subtitle,
+        subtitles: subtitle ? [subtitle.url] : [],
+        size_mb: Math.round((playable.filesize || cached.data.file_size_bytes || 0) / 1024 / 1024),
+        seeds: cached.data.seeds || 0,
+        poster: cached.data.poster_path ? `https://image.tmdb.org/t/p/w500${cached.data.poster_path}` : null,
+        backdrop: cached.data.backdrop_path ? `https://image.tmdb.org/t/p/w1280${cached.data.backdrop_path}` : null,
+        cached: true,
+        refreshed: true,
+      };
+    }
+
+    console.log('   ⚠ Cached RD link is no longer playable; continuing with torrent search...');
+  }
+
+  // 2) Re-unrestrict
+
+  if (cached.hit && !cached.fresh && cached.data?.magnet) {
+    try {
+      let playable = null;
+
+      if (cached.data.rd_link) {
+        playable = await rdGetPlayableUrl(cached.data.rd_link);
       }
-    );
 
-  if (
-    cached?.playable?.url
-  ) {
-    const playable =
-      cached.playable;
-
-    const subtitle =
-      withSubs
-        ? await searchOpenSubtitles(
-            {
-              tmdbId:
-                parseInt(
-                  id
-                ),
-
-              type,
-
-              season:
-                sNum,
-
-              episode:
-                eNum,
-
-              title:
-                cached.cached
-                  .data
-                  .title,
-
-              year:
-                cached.cached
-                  .data
-                  .year
-            }
-          )
-        : null;
-
-    const localURL =
-      playable.type === "mp4"
-        ? buildLocalStreamURL(
-            {
-              id,
-              type,
-              season:
-                sNum,
-              episode:
-                eNum
-            }
-          )
-        : playable.url;
-
-    return {
-      success:
-        true,
-
-      provider:
-        `real-debrid+${
-          cached.cached
-            .data
-            .source ||
-          "cache"
-        }`,
-
-      quality:
-        cached.cached
-          .data
-          .quality,
-
-      title:
-        cached.cached
-          .data
-          .title,
-
-      year:
-        cached.cached
-          .data
-          .year,
-
-      filename:
-        playable.filename ||
-        cached.cached
-          .data
-          .filename,
-
-      stream_url:
-        localURL,
-
-      stream_type:
-        playable.type ===
-        "mp4"
-          ? "mp4-proxy"
-          : playable.type,
-
-      subtitle,
-
-      subtitles:
-        subtitle
-          ? [subtitle.url]
-          : [],
-
-      size_mb:
-        Math.round(
-          (
-            playable.filesize ||
-            cached.cached
-              .data
-              .file_size_bytes ||
-            0
-          ) /
-            1024 /
-            1024
-        ),
-
-      seeds:
-        cached.cached
-          .data
-          .seeds ||
-        0,
-
-      poster:
-        getPoster(
-          cached.cached
-            .data
-            .poster_path
-        ),
-
-      backdrop:
-        getBackdrop(
-          cached.cached
-            .data
-            .backdrop_path
-        ),
-
-      cached:
-        true,
-
-      refreshed:
-        true
-    };
-  }
-
-  // ----------------------------------------------------------
-  // TMDB
-  // ----------------------------------------------------------
-
-  const meta =
-    await getTMDBMeta(
-      id,
-      type
-    );
-
-  if (!meta) {
-    return {
-      success:
-        false,
-
-      error:
-        "TMDB not found"
-    };
-  }
-
-  const displayTitle =
-    meta.title ||
-    meta.name ||
-    meta.original_title ||
-    meta.original_name;
-
-  const year =
-    (
-      meta.release_date ||
-      meta.first_air_date ||
-      ""
-    ).slice(
-      0,
-      4
-    );
-
-  const poster =
-    getPoster(
-      meta.poster_path
-    );
-
-  const backdrop =
-    getBackdrop(
-      meta.backdrop_path
-    );
-
-  const imdbId =
-    meta.imdb_id ||
-    meta.external_ids
-      ?.imdb_id;
-
-  if (
-    !imdbId
-  ) {
-    return {
-      success:
-        false,
-
-      error:
-        "IMDB ID not found for this title"
-    };
-  }
-
-  console.log(
-    `\n🎬 ${displayTitle} (${year || "?"}) | ${type} S${sNum || 1}E${eNum || 1}`
-  );
-
-  console.log(
-    `📺 IMDB: ${imdbId}`
-  );
-
-  // ----------------------------------------------------------
-  // TORRENTIO
-  // ----------------------------------------------------------
-
-  let torrents =
-    await searchTorrentio(
-      imdbId,
-      type,
-      sNum,
-      eNum
-    );
-
-  if (
-    !torrents.length
-  ) {
-    return {
-      success:
-        false,
-
-      error:
-        `لم يتم العثور على "${displayTitle}"`
-    };
-  }
-
-  console.log(
-    `📊 إجمالي النتائج: ${torrents.length} torrent`
-  );
-
-  torrents.sort(
-    (a, b) =>
-      getTorrentScore(
-        b
-      ) -
-      getTorrentScore(
-        a
-      )
-  );
-
-  // ----------------------------------------------------------
-  // ATTEMPTS
-  // ----------------------------------------------------------
-
-  const maxAttempts =
-    Math.min(
-      12,
-      torrents.length
-    );
-
-  for (
-    let index = 0;
-    index < maxAttempts;
-    index++
-  ) {
-    const torrent =
-      torrents[index];
-
-    console.log(
-      `🔄 [${index + 1}/${maxAttempts}] ${torrent.quality} | ${String(
-        torrent.name || ""
-      ).slice(
-        0,
-        100
-      )}`
-    );
-
-    const added =
-      await rdAddMagnet(
-        torrent.magnet
-      );
-
-    // 451 / infringing_file is skipped.
-    if (
-      !added?.id
-    ) {
-      continue;
-    }
-
-    console.log(
-      `   ✓ Added to RD: ${added.id}`
-    );
-
-    await rdSelectFiles(
-      added.id,
-      "all"
-    );
-
-    const torrentInfo =
-      await rdWaitForTorrent(
-        added.id
-      );
-
-    if (
-      !torrentInfo
-    ) {
-      console.log(
-        "   ❌ Torrent did not become ready"
-      );
-
-      continue;
-    }
-
-    console.log(
-      `   ✓ Prepared by RD: ${
-        torrentInfo.filename ||
-        "ready"
-      }`
-    );
-
-    if (
-      !torrentInfo.links?.length
-    ) {
-      console.log(
-        "   ❌ No links"
-      );
-
-      continue;
-    }
-
-    // --------------------------------------------------------
-    // BEST PLAYABLE
-    // --------------------------------------------------------
-
-    const playable =
-      await rdResolveBestPlayableLink(
-        torrentInfo
-      );
-
-    if (
-      !playable?.url
-    ) {
-      console.log(
-        "   ❌ No browser-compatible stream"
-      );
-
-      continue;
-    }
-
-    console.log(
-      `   ✅ Got stream URL (${playable.type})!`
-    );
-
-    const streamURL =
-      playable.type ===
-      "mp4"
-        ? buildLocalStreamURL(
-            {
-              id,
-              type,
-              season:
-                sNum,
-              episode:
-                eNum
-            }
-          )
-        : playable.url;
-
-    await cache.setCache(
-      {
-        tmdb_id:
-          parseInt(
-            id
-          ),
-
-        media_type:
+      if (!playable?.url && cached.data.rd_torrent_id) {
+        const info = await rdGetTorrentInfo(cached.data.rd_torrent_id);
+
+        if (info?.status === 'downloaded' && info.links?.length) {
+          const resolved = await rdResolveBestPlayableLink(info);
+
+          if (resolved?.url) playable = resolved;
+        }
+      }
+
+      if (!playable?.url) {
+        const added = await rdAddMagnet(cached.data.magnet);
+
+        if (added?.id) {
+          await rdSelectFiles(added.id, 'all');
+
+          const info = await rdWaitForTorrent(added.id, 180000);
+
+          if (info?.links?.length) {
+            const resolved = await rdResolveBestPlayableLink(info);
+
+            if (resolved?.url) playable = resolved;
+          }
+        }
+      }
+
+      if (playable?.url) {
+        await cache.setCache({
+          tmdb_id: parseInt(id),
+          media_type: type,
+          season: sNum,
+          episode: eNum,
+          title: cached.data.title,
+          year: cached.data.year,
+          stream_url: playable.type === "mp4" ? makeStreamProxyUrl({ id, type, season: sNum, episode: eNum }) : playable.url,
+          stream_type: playable.type === "mp4" ? "mp4-proxy" : playable.type,
+          rd_torrent_id: cached.data.rd_torrent_id,
+          rd_link: playable.link || cached.data.rd_link,
+          magnet: cached.data.magnet,
+          source: cached.data.source,
+          status: 'ready',
+          file_size_bytes: playable.filesize || cached.data.file_size_bytes,
+          quality: cached.data.quality,
+          filename: playable.filename || cached.data.filename,
+          seeds: cached.data.seeds,
+          poster_path: cached.data.poster_path,
+          backdrop_path: cached.data.backdrop_path,
+        });
+
+        const subtitle = withSubs ? await searchOpenSubtitles({
+          tmdbId: parseInt(id),
           type,
+          season: sNum,
+          episode: eNum,
+          title: cached.data.title,
+          year: cached.data.year,
+        }) : null;
 
-        season:
-          sNum,
-
-        episode:
-          eNum,
-
-        title:
-          displayTitle,
-
-        year,
-
-        original_title:
-          meta.original_title ||
-          meta.original_name,
-
-        overview:
-          meta.overview,
-
-        poster_path:
-          meta.poster_path,
-
-        backdrop_path:
-          meta.backdrop_path,
-
-        runtime:
-          meta.runtime ||
-          meta.episode_run_time?.[0] ||
-          null,
-
-        vote_average:
-          meta.vote_average,
-
-        genres:
-          meta.genres
-            ?.map(
-              (genre) =>
-                genre.name
-            )
-            .join(
-              ", "
-            ) ||
-          null,
-
-        rd_torrent_id:
-          added.id,
-
-        rd_link:
-          playable.link,
-
-        stream_url:
-          streamURL,
-
-        stream_type:
-          playable.type ===
-          "mp4"
-            ? "mp4-proxy"
-            : playable.type,
-
-        filename:
-          playable.filename ||
-          torrentInfo.filename,
-
-        file_size_bytes:
-          playable.filesize ||
-          torrent.size ||
-          0,
-
-        quality:
-          torrent.quality,
-
-        source:
-          torrent.source,
-
-        magnet:
-          torrent.magnet,
-
-        seeds:
-          torrent.seeds ||
-          0,
-
-        info_hash:
-          torrent.infoHash,
-
-        status:
-          "ready"
+        return {
+          success: true,
+          provider: `real-debrid+${cached.data.source || 'cache'}`,
+          quality: cached.data.quality,
+          title: cached.data.title,
+          stream_url: playable.type === "mp4" ? makeStreamProxyUrl({ id, type, season: sNum, episode: eNum }) : playable.url,
+          stream_type: playable.type === "mp4" ? "mp4-proxy" : playable.type,
+          subtitle,
+          subtitles: subtitle ? [subtitle.url] : [],
+          poster: cached.data.poster_path ? `https://image.tmdb.org/t/p/w500${cached.data.poster_path}` : null,
+          backdrop: cached.data.backdrop_path ? `https://image.tmdb.org/t/p/w1280${cached.data.backdrop_path}` : null,
+          cached: true,
+          refreshed: true,
+        };
       }
-    );
-
-    const subtitle =
-      withSubs
-        ? await searchOpenSubtitles(
-            {
-              tmdbId:
-                parseInt(
-                  id
-                ),
-
-              type,
-
-              season:
-                sNum,
-
-              episode:
-                eNum,
-
-              title:
-                displayTitle,
-
-              year
-            }
-          )
-        : null;
-
-    return {
-      success:
-        true,
-
-      provider:
-        `real-debrid+${torrent.source}`,
-
-      quality:
-        torrent.quality,
-
-      title:
-        displayTitle,
-
-      year,
-
-      filename:
-        playable.filename ||
-        torrentInfo.filename,
-
-      stream_url:
-        streamURL,
-
-      stream_type:
-        playable.type ===
-        "mp4"
-          ? "mp4-proxy"
-          : playable.type,
-
-      subtitle,
-
-      subtitles:
-        subtitle
-          ? [subtitle.url]
-          : [],
-
-      size_mb:
-        Math.round(
-          (
-            playable.filesize ||
-            torrent.size ||
-            0
-          ) /
-            1024 /
-            1024
-        ),
-
-      seeds:
-        torrent.seeds ||
-        0,
-
-      poster,
-
-      backdrop,
-
-      cached:
-        false
-    };
+    } catch (err) {
+      console.warn('re-unrestrict failed:', err.message);
+    }
   }
 
-  return {
-    success:
-      false,
+  // 3) Fresh fetch
 
-    error:
-      `فشل تحميل/تجهيز أي من ${torrents.length} torrents`
-  };
+  const meta = await getTMDBMeta(id, type);
+
+  if (!meta) return { success: false, error: "TMDB not found" };
+
+
+  const displayTitle = meta.title || meta.name || meta.original_title || meta.original_name;
+
+  const year = (meta.release_date || meta.first_air_date || '').slice(0, 4);
+
+  const poster = meta.poster_path ? `https://image.tmdb.org/t/p/w500${meta.poster_path}` : null;
+
+  const backdrop = meta.backdrop_path ? `https://image.tmdb.org/t/p/w1280${meta.backdrop_path}` : null;
+
+
+  console.log(`\n🎬 ${displayTitle} (${year || "?"}) | ${type} S${sNum || 1}E${eNum || 1}`);
+
+
+  // نحتاج IMDB ID لـ Torrentio
+
+  const imdbId = meta.imdb_id || meta.external_ids?.imdb_id;
+
+  if (!imdbId) {
+
+    return { success: false, error: "IMDB ID not found for this title" };
+
+  }
+
+
+  console.log(`   📺 IMDB: ${imdbId}`);
+
+
+  // 🆕 البحث عبر Torrentio فقط
+
+  const torrents = await searchTorrentio(imdbId, type, sNum, eNum);
+
+
+  if (torrents.length === 0) {
+
+    return { success: false, error: `لم يتم العثور على "${displayTitle}"` };
+
+  }
+
+
+  console.log(`📊 إجمالي النتائج: ${torrents.length} torrent`);
+
+
+  // ترتيب حسب الجودة
+
+  torrents.sort((a, b) => getQualityScore(b) - getQualityScore(a));
+
+  const maxAttempts = Math.min(8, torrents.length);
+
+
+  for (let i = 0; i < maxAttempts; i++) {
+
+    const torrent = torrents[i];
+
+    console.log(`\n🔄 [${i + 1}/${maxAttempts}] ${torrent.quality} | ${(torrent.name || '').substring(0, 60)}`);
+
+
+    const added = await rdAddMagnet(torrent.magnet);
+
+    if (!added?.id) {
+
+      console.log(`   ❌ Failed to add`);
+
+      continue;
+
+    }
+
+    console.log(`   ✓ Added to RD: ${added.id}`);
+
+
+    await rdSelectFiles(added.id, 'all');
+
+
+    const torrentInfo = await rdWaitForTorrent(added.id);
+
+    if (!torrentInfo) {
+
+      console.log(`   ❌ Download timeout/error`);
+
+      continue;
+
+    }
+
+    console.log(`   ✓ Downloaded: ${torrentInfo.filename}`);
+
+
+    const links = torrentInfo.links || [];
+
+    if (links.length === 0) {
+
+      console.log(`   ❌ No links found`);
+
+      continue;
+
+    }
+
+
+    // Inspect all returned files through mediaInfos and choose the
+    // most browser-friendly one (MP4/H264 first), rather than simply
+    // choosing the largest MKV.
+    const playable = await rdResolveBestPlayableLink(torrentInfo);
+
+    if (!playable?.url) {
+      console.log(`   ❌ No browser-compatible RD stream for this torrent`);
+      continue;
+    }
+
+    console.log(`   ✅ Got stream URL (${playable.type})!`);
+
+
+    await cache.setCache({
+
+      tmdb_id: parseInt(id), media_type: type, season: sNum, episode: eNum,
+
+      title: displayTitle, year,
+
+      original_title: meta.original_title || meta.original_name,
+
+      overview: meta.overview, poster_path: meta.poster_path, backdrop_path: meta.backdrop_path,
+
+      runtime: meta.runtime || (meta.episode_run_time?.[0]) || null,
+
+      vote_average: meta.vote_average,
+
+      genres: meta.genres?.map(g => g.name).join(', ') || null,
+
+      rd_torrent_id: added.id, rd_link: playable.link,
+
+      stream_url: playable.url, stream_type: playable.type,
+
+      filename: playable.filename || torrentInfo.filename,
+
+      file_size_bytes: playable.filesize || torrent.size || 0, quality: torrent.quality,
+
+      source: torrent.source, magnet: torrent.magnet, seeds: torrent.seeds || 0,
+
+      info_hash: torrent.infoHash, status: 'ready',
+
+    });
+
+
+    const subtitle = withSubs ? await searchOpenSubtitles({
+
+      tmdbId: parseInt(id), type, season: sNum, episode: eNum,
+
+      title: displayTitle, year,
+
+    }) : null;
+
+
+    return {
+
+      success: true,
+
+      provider: `real-debrid+${torrent.source}`,
+
+      quality: torrent.quality,
+
+      title: displayTitle, year,
+
+      filename: playable.filename || torrentInfo.filename,
+
+      stream_url: playable.url,
+
+      stream_type: playable.type,
+
+      subtitle, subtitles: subtitle ? [subtitle.url] : [],
+
+      size_mb: Math.round((playable.filesize || torrent.size || 0) / 1024 / 1024),
+
+      seeds: torrent.seeds || 0,
+
+      poster, backdrop, cached: false,
+
+    };
+
+  }
+
+
+  return { success: false, error: `فشل تحميل أي من ${torrents.length} torrents` };
+
 }
 
 
-// ============================================================
-// SUBTITLES API
-// ============================================================
+// =============================================================
 
-app.get(
-  "/api/subtitles",
-  async (
-    req,
-    res
-  ) => {
-    const {
-      tmdb_id,
-      type,
-      season,
-      episode,
-      title,
-      year
-    } = req.query;
+// ENDPOINTS
 
-    if (
-      !tmdb_id &&
-      !title
-    ) {
-      return res
-        .status(400)
-        .json({
-          success:
-            false,
+// =============================================================
 
-          error:
-            "Missing tmdb_id or title"
-        });
-    }
 
-    try {
-      const subtitle =
-        await searchOpenSubtitles(
-          {
-            tmdbId:
-              tmdb_id
-                ? parseInt(
-                    tmdb_id
-                  )
-                : null,
+app.get("/api/subtitles", async (req, res) => {
 
-            type,
+  const { tmdb_id, type, season, episode, title, year } = req.query;
 
-            season,
+  if (!tmdb_id && !title) return res.status(400).json({ success: false, error: "Missing tmdb_id or title" });
 
-            episode,
+  try {
 
-            title,
+    const sub = await searchOpenSubtitles({
 
-            year
-          }
-        );
+      tmdbId: tmdb_id ? parseInt(tmdb_id) : null, type, season, episode, title, year,
 
-      if (!subtitle) {
-        return res.json({
-          success:
-            false,
+    });
 
-          error:
-            "no_subtitles_found"
-        });
-      }
+    if (!sub) return res.json({ success: false, error: "no_subtitles_found" });
 
-      return res.json({
-        success:
-          true,
+    res.json({ success: true, subtitle: sub });
 
-        subtitle
-      });
-    } catch (err) {
-      return res
-        .status(500)
-        .json({
-          success:
-            false,
+  } catch (err) {
 
-          error:
-            err.message
-        });
-    }
+    res.status(500).json({ success: false, error: err.message });
+
   }
-);
 
+});
 
-// ============================================================
-// STREAM PROXY
-// ============================================================
 
-app.get(
-  "/api/stream",
-  async (
-    req,
-    res
-  ) => {
-    const {
-      id,
-      type,
-      season,
-      episode
-    } = req.query;
+app.get("/api/stream", async (req, res) => {
 
-    if (
-      !id ||
-      !type
-    ) {
-      return res
-        .status(400)
-        .json({
-          success:
-            false,
+  const { id, type, season, episode } = req.query;
 
-          error:
-            "Missing id or type"
-        });
-    }
-
-    const sNum =
-      type === "tv"
-        ? parseInt(
-            season || 1
-          )
-        : null;
-
-    const eNum =
-      type === "tv"
-        ? parseInt(
-            episode || 1
-          )
-        : null;
-
-    try {
-      const resolved =
-        await resolveCachedPlayback(
-          {
-            id,
-            type,
-
-            season:
-              sNum,
-
-            episode:
-              eNum
-          }
-        );
-
-      if (
-        !resolved?.playable?.url
-      ) {
-        return res
-          .status(404)
-          .json({
-            success:
-              false,
-
-            error:
-              "stream_unavailable"
-          });
-      }
-
-      const playable =
-        resolved.playable;
-
-      // HLS
-
-      if (
-        playable.type ===
-        "hls"
-      ) {
-        return res.redirect(
-          307,
-          playable.url
-        );
-      }
-
-      // DASH
-
-      if (
-        playable.type ===
-        "dash"
-      ) {
-        return res.redirect(
-          307,
-          playable.url
-        );
-      }
-
-      // WebM can be passed through directly.
-
-      if (
-        playable.type ===
-        "webm"
-      ) {
-        return res.redirect(
-          307,
-          playable.url
-        );
-      }
-
-      // Only MP4 is proxied here.
-
-      if (
-        playable.type !==
-        "mp4"
-      ) {
-        return res
-          .status(415)
-          .json({
-            success:
-              false,
-
-            error:
-              "unsupported_stream_type"
-          });
-      }
-
-      const parsed =
-        new URL(
-          playable.url
-        );
-
-      const lib =
-        parsed.protocol ===
-        "https:"
-          ? https
-          : http;
-
-      const headers = {
-        "User-Agent":
-          BROWSER_HEADERS[
-            "User-Agent"
-          ],
-
-        Accept:
-          "*/*",
-
-        Connection:
-          "keep-alive"
-      };
-
-      if (
-        req.headers.range
-      ) {
-        headers.Range =
-          req.headers.range;
-      }
-
-      const proxy =
-        lib.request(
-          {
-            method:
-              "GET",
-
-            hostname:
-              parsed.hostname,
-
-            port:
-              parsed.port ||
-              (
-                parsed.protocol ===
-                "https:"
-                  ? 443
-                  : 80
-              ),
-
-            path:
-              parsed.pathname +
-              parsed.search,
-
-            headers,
-
-            timeout:
-              30000
-          },
-
-          (response) => {
-            const passthroughHeaders = [
-              "content-type",
-              "content-length",
-              "content-range",
-              "accept-ranges",
-              "etag",
-              "last-modified",
-              "cache-control"
-            ];
-
-            for (
-              const header of passthroughHeaders
-            ) {
-              const value =
-                response.headers[
-                  header
-                ];
-
-              if (
-                value !==
-                undefined
-              ) {
-                res.setHeader(
-                  header,
-                  value
-                );
-              }
-            }
-
-            if (
-              !res.getHeader(
-                "Content-Type"
-              )
-            ) {
-              res.setHeader(
-                "Content-Type",
-                playable.mimeType ||
-                  "video/mp4"
-              );
-            }
-
-            res.status(
-              response.statusCode ||
-                502
-            );
-
-            response.pipe(
-              res
-            );
-          }
-        );
-
-      proxy.on(
-        "timeout",
-        () => {
-          proxy.destroy(
-            new Error(
-              "Real-Debrid stream timeout"
-            )
-          );
-        }
-      );
-
-      proxy.on(
-        "error",
-        (err) => {
-          if (
-            !res.headersSent
-          ) {
-            res
-              .status(502)
-              .json({
-                success:
-                  false,
-
-                error:
-                  "stream_proxy_error",
-
-                message:
-                  err.message
-              });
-          } else {
-            res.destroy(
-              err
-            );
-          }
-        }
-      );
-
-      req.on(
-        "close",
-        () => {
-          if (
-            !res.writableEnded
-          ) {
-            proxy.destroy();
-          }
-        }
-      );
-
-      proxy.end();
-    } catch (err) {
-      console.error(
-        "❌ Stream endpoint error:",
-        err.message
-      );
-
-      if (
-        !res.headersSent
-      ) {
-        res
-          .status(500)
-          .json({
-            success:
-              false,
-
-            error:
-              err.message
-          });
-      }
-    }
-  }
-);
-
-
-// ============================================================
-// PLAY API
-// ============================================================
-
-app.get(
-  "/api/play",
-  async (
-    req,
-    res
-  ) => {
-    const {
-      id,
-      type,
-      season,
-      episode,
-      with_subs =
-        "1"
-    } = req.query;
-
-    if (
-      !id ||
-      !type
-    ) {
-      return res
-        .status(400)
-        .json({
-          success:
-            false,
-
-          error:
-            "Missing id or type"
-        });
-    }
-
-    req.setTimeout(
-      300000
-    );
-
-    res.setTimeout(
-      300000
-    );
-
-    const sNum =
-      type === "tv"
-        ? parseInt(
-            season || 1
-          )
-        : null;
-
-    const eNum =
-      type === "tv"
-        ? parseInt(
-            episode || 1
-          )
-        : null;
-
-    try {
-      const result =
-        await tryGetStream(
-          {
-            id,
-
-            type,
-
-            sNum,
-
-            eNum,
-
-            withSubs:
-              with_subs === "1"
-          }
-        );
-
-      if (
-        result.success
-      ) {
-        /*
-         * IMPORTANT:
-         *
-         * The frontend is hosted separately from Railway.
-         * A relative /api/stream URL would point to the frontend domain.
-         *
-         * Convert it into:
-         *
-         * https://bluestream-rd-production.up.railway.app/api/stream?...
-         */
-
-        if (
-          typeof result.stream_url ===
-            "string" &&
-          result.stream_url.startsWith(
-            "/"
-          )
-        ) {
-          const forwardedProto =
-            req.headers[
-              "x-forwarded-proto"
-            ];
-
-          const forwardedHost =
-            req.headers[
-              "x-forwarded-host"
-            ];
-
-          const protocol =
-            forwardedProto
-              ? String(
-                  forwardedProto
-                )
-                  .split(
-                    ","
-                  )[0]
-                  .trim()
-              : (
-                  req.protocol ||
-                  "https"
-                );
-
-          const host =
-            forwardedHost
-              ? String(
-                  forwardedHost
-                )
-                  .split(
-                    ","
-                  )[0]
-                  .trim()
-              : req.get(
-                  "host"
-                );
-
-          result.stream_url =
-            `${protocol}://${host}${result.stream_url}`;
-        }
-
-        return res.json(
-          result
-        );
-      }
-
-      return res
-        .status(404)
-        .json(
-          result
-        );
-    } catch (err) {
-      console.error(
-        "❌ Error:",
-        err
-      );
-
-      return res
-        .status(500)
-        .json({
-          success:
-            false,
-
-          error:
-            err.message
-        });
-    }
-  }
-);
-
-
-// ============================================================
-// CACHE STATS
-// ============================================================
-
-app.get(
-  "/api/cache/stats",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      res.json({
-        success:
-          true,
-
-        stats:
-          await cache.getStats()
-      });
-    } catch (err) {
-      res
-        .status(500)
-        .json({
-          success:
-            false,
-
-          error:
-            err.message
-        });
-    }
-  }
-);
-
-
-// ============================================================
-// CACHE CLEAN
-// ============================================================
-
-app.post(
-  "/api/cache/clean",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      res.json({
-        success:
-          true,
-
-        expired_marked:
-          await cache.cleanExpired()
-      });
-    } catch (err) {
-      res
-        .status(500)
-        .json({
-          success:
-            false,
-
-          error:
-            err.message
-        });
-    }
-  }
-);
-
-
-// ============================================================
-// DELETE CACHE
-// ============================================================
-
-app.delete(
-  "/api/cache/:tmdb_id/:type",
-  async (
-    req,
-    res
-  ) => {
-    try {
-      const {
-        tmdb_id,
-        type
-      } = req.params;
-
-      const {
-        season,
-        episode
-      } = req.query;
-
-      const pool =
-        cache.initPool();
-
-      const [
-        result
-      ] =
-        await pool.execute(
-          `
-          DELETE FROM media_cache
-          WHERE tmdb_id = ?
-            AND media_type = ?
-            AND season <=> ?
-            AND episode <=> ?
-          `,
-          [
-            parseInt(
-              tmdb_id
-            ),
-
-            type,
-
-            season ||
-              null,
-
-            episode ||
-              null
-          ]
-        );
-
-      res.json({
-        success:
-          true,
-
-        deleted:
-          result.affectedRows
-      });
-    } catch (err) {
-      res
-        .status(500)
-        .json({
-          success:
-            false,
-
-          error:
-            err.message
-        });
-    }
-  }
-);
-
-
-// ============================================================
-// HEALTH
-// ============================================================
-
-app.get(
-  "/",
-  (
-    req,
-    res
-  ) => {
-    res.json({
-      status:
-        "✅ BlueStream API v7.6.1",
-
-      version:
-        "7.6.1",
-
-      features: [
-        "Torrentio aggregator",
-        "Real-Debrid streaming",
-        "mediaInfos optional",
-        "HLS first",
-        "MP4/H264 priority",
-        "fresh MP4 proxy",
-        "automatic Arabic subtitles",
-        "absolute Railway stream URLs"
-      ],
-
-      endpoints: {
-        play:
-          "/api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1&with_subs=1",
-
-        stream:
-          "/api/stream?id={tmdb_id}&type={movie|tv}&season=1&episode=1",
-
-        subtitles:
-          "/api/subtitles?tmdb_id=...&type=movie&title=..."
-      }
+  if (!id || !type) {
+    return res.status(400).json({
+      success: false,
+      error: "Missing id or type"
     });
   }
-);
 
+  const sNum = type === "tv" ? parseInt(season || 1, 10) : null;
+  const eNum = type === "tv" ? parseInt(episode || 1, 10) : null;
 
-// ============================================================
-// START
-// ============================================================
+  try {
+    // IMPORTANT: /api/stream is hit repeatedly by HTML5 Range requests.
+    // It must NOT call mediaInfos/transcode/torrent inspection.
+    const cached = await cache.getCache(id, type, sNum, eNum);
 
-app.listen(
-  PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `\n🎬 BlueStream API v7.6.1 running on port ${PORT}`
+    if (!cached?.hit || !cached.data) {
+      return res.status(404).json({
+        success: false,
+        error: "stream_cache_not_found"
+      });
+    }
+
+    let rdLink = cached.data.rd_link || null;
+
+    // Recover a source link only when the cache is missing one.
+    if (!rdLink && cached.data.rd_torrent_id) {
+      const torrentInfo = await rdGetTorrentInfo(cached.data.rd_torrent_id);
+
+      if (
+        torrentInfo?.status === "downloaded" &&
+        Array.isArray(torrentInfo.links) &&
+        torrentInfo.links.length
+      ) {
+        rdLink = torrentInfo.links[0];
+      }
+    }
+
+    if (!rdLink) {
+      return res.status(404).json({
+        success: false,
+        error: "rd_link_not_found"
+      });
+    }
+
+    // Cache the fresh direct RD URL for a short period so multiple Range
+    // requests do not hammer the Real-Debrid unrestrict endpoint.
+    let fresh = getFreshStreamCache(rdLink);
+
+    if (!fresh) {
+      const unrestricted = await rdUnrestrict(rdLink);
+
+      if (unrestricted?.download) {
+        fresh = {
+          downloadURL: unrestricted.download,
+          mimeType: unrestricted.mimeType || "video/mp4",
+          filename: unrestricted.filename || cached.data.filename || "video.mp4"
+        };
+
+        setFreshStreamCache(rdLink, fresh);
+      } else if (cached.data.rd_torrent_id) {
+        // One recovery attempt if the old source link expired.
+        const torrentInfo = await rdGetTorrentInfo(cached.data.rd_torrent_id);
+
+        if (
+          torrentInfo?.status === "downloaded" &&
+          Array.isArray(torrentInfo.links) &&
+          torrentInfo.links.length
+        ) {
+          const fallbackLink = torrentInfo.links[0];
+          const fallback = await rdUnrestrict(fallbackLink);
+
+          if (fallback?.download) {
+            rdLink = fallbackLink;
+            fresh = {
+              downloadURL: fallback.download,
+              mimeType: fallback.mimeType || "video/mp4",
+              filename: fallback.filename || cached.data.filename || "video.mp4"
+            };
+
+            setFreshStreamCache(rdLink, fresh);
+          }
+        }
+      }
+    }
+
+    if (!fresh?.downloadURL) {
+      return res.status(410).json({
+        success: false,
+        error: "real_debrid_link_expired"
+      });
+    }
+
+    const parsed = new URL(fresh.downloadURL);
+    const lib = parsed.protocol === "https:" ? https : http;
+
+    const headers = {
+      "User-Agent": BROWSER_HEADERS["User-Agent"],
+      Accept: "*/*",
+      Connection: "keep-alive"
+    };
+
+    if (req.headers.range) {
+      headers.Range = req.headers.range;
+    }
+
+    const proxy = lib.request(
+      {
+        method: "GET",
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === "https:" ? 443 : 80),
+        path: parsed.pathname + parsed.search,
+        headers,
+        timeout: 30000
+      },
+      (proxyRes) => {
+        const passthrough = [
+          "content-type",
+          "content-length",
+          "content-range",
+          "accept-ranges",
+          "etag",
+          "last-modified",
+          "cache-control"
+        ];
+
+        for (const header of passthrough) {
+          const value = proxyRes.headers[header];
+          if (value !== undefined) {
+            res.setHeader(header, value);
+          }
+        }
+
+        if (!res.getHeader("Content-Type")) {
+          res.setHeader(
+            "Content-Type",
+            fresh.mimeType || "video/mp4"
+          );
+        }
+
+        res.setHeader("Accept-Ranges", "bytes");
+        res.status(proxyRes.statusCode || 502);
+        proxyRes.pipe(res);
+      }
     );
 
-    console.log(
-      `✅ RD Token: ${
-        RD_TOKEN
-          ? "Loaded"
-          : "MISSING"
-      }`
-    );
+    proxy.on("timeout", () => {
+      proxy.destroy(new Error("Real-Debrid stream timeout"));
+    });
 
-    console.log(
-      `✅ TMDB Key: ${
-        TMDB_KEY
-          ? "Loaded"
-          : "MISSING"
-      }`
-    );
+    proxy.on("error", (err) => {
+      if (!res.headersSent) {
+        res.status(502).json({
+          success: false,
+          error: "stream_proxy_error",
+          message: err.message
+        });
+      } else {
+        res.destroy(err);
+      }
+    });
 
-    console.log(
-      `✅ OpenSubtitles: ${
-        OS_API_KEY
-          ? "Loaded"
-          : "MISSING"
-      }`
-    );
+    req.on("close", () => {
+      if (!res.writableEnded) {
+        proxy.destroy();
+      }
+    });
 
-    console.log(
-      "✅ Torrentio: configured"
-    );
+    proxy.end();
+  } catch (err) {
+    console.error("❌ /api/stream error:", err.message);
 
-    console.log(
-      "✅ Real-Debrid mediaInfos: optional"
-    );
-
-    console.log(
-      "✅ Real-Debrid transcode: HLS first"
-    );
-
-    console.log(
-      "✅ Streaming proxy: enabled"
-    );
-
-    console.log(
-      "✅ Absolute Railway stream URLs: enabled"
-    );
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: err.message
+      });
+    }
   }
-);
+});
+
+
+app.get("/api/play", async (req, res) => {
+
+  const { id, type, season, episode, with_subs = '1' } = req.query;
+
+  if (!id || !type) return res.status(400).json({ success: false, error: "Missing id or type" });
+
+  req.setTimeout(300000);
+
+  res.setTimeout(300000);
+
+  const sNum = type === 'tv' ? parseInt(season || 1) : null;
+
+  const eNum = type === 'tv' ? parseInt(episode || 1) : null;
+
+  try {
+
+    const result = await tryGetStream({ id, type, sNum, eNum, withSubs: with_subs === '1' });
+
+    if (result.success) {
+      // When the player frontend is hosted on a different domain than Railway,
+      // a relative /api/stream URL would incorrectly point to the frontend host.
+      // Convert local stream-proxy URLs into absolute Railway/API URLs.
+      if (typeof result.stream_url === "string" && result.stream_url.startsWith("/")) {
+        const forwardedProto = req.headers["x-forwarded-proto"];
+        const forwardedHost = req.headers["x-forwarded-host"];
+
+        const protocol = forwardedProto
+          ? String(forwardedProto).split(",")[0].trim()
+          : (req.protocol || "https");
+
+        const host = forwardedHost
+          ? String(forwardedHost).split(",")[0].trim()
+          : req.get("host");
+
+        result.stream_url = `${protocol}://${host}${result.stream_url}`;
+      }
+
+      return res.json(result);
+    }
+
+    return res.status(404).json(result);
+
+  } catch (err) {
+
+    console.error("❌ Error:", err);
+
+    return res.status(500).json({ success: false, error: err.message });
+
+  }
+
+});
+
+
+app.get("/api/cache/stats", async (req, res) => {
+
+  try { res.json({ success: true, stats: await cache.getStats() }); }
+
+  catch (err) { res.status(500).json({ success: false, error: err.message }); }
+
+});
+
+
+app.post("/api/cache/clean", async (req, res) => {
+
+  try { res.json({ success: true, expired_marked: await cache.cleanExpired() }); }
+
+  catch (err) { res.status(500).json({ success: false, error: err.message }); }
+
+});
+
+
+app.delete("/api/cache/:tmdb_id/:type", async (req, res) => {
+
+  try {
+
+    const { tmdb_id, type } = req.params;
+
+    const { season, episode } = req.query;
+
+    const p = cache.initPool();
+
+    const [result] = await p.execute(
+
+      `DELETE FROM media_cache WHERE tmdb_id = ? AND media_type = ? AND season <=> ? AND episode <=> ?`,
+
+      [parseInt(tmdb_id), type, season || null, episode || null]
+
+    );
+
+    res.json({ success: true, deleted: result.affectedRows });
+
+  } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+
+});
+
+
+app.get("/", (req, res) => {
+
+  res.json({
+
+    status: "✅ BlueStream API v7.6.2 (Streaming + Real-Debrid + Transcode)",
+
+    version: "7.6.2",
+
+    features: ["Torrentio aggregator", "Real-Debrid streaming", "mediaInfos optional", "HLS first", "MP4/H264 priority", "automatic Arabic subtitles", "fresh stream proxy"],
+
+    sources: ["1337x", "ThePirateBay", "RARBG", "TorrentGalaxy", "YTS", "EZTV", "NyaaSi", "AniDex", "MagnetDL", "Limetorrent", "Torrent9", "ilCorSaRoNeRo", "Rutracker", "Comando", "BluDV", "+10 more"],
+
+    endpoints: {
+
+      play: "/api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1&with_subs=1",
+
+      subtitles: "/api/subtitles?tmdb_id=...&type=movie&title=...",
+      stream: "/api/stream?id={tmdb_id}&type={movie|tv}&season=1&episode=1",
+
+    },
+
+  });
+
+});
+
+
+app.listen(PORT, "0.0.0.0", () => {
+
+  console.log(`\n🎬 BlueStream API v7.6.2 running on port ${PORT}`);
+
+  console.log(`✅ RD Token: ${RD_TOKEN ? 'Loaded' : 'MISSING'}`);
+
+  console.log(`✅ TMDB Key: ${TMDB_KEY ? 'Loaded' : 'MISSING'}`);
+
+  console.log(`✅ OpenSubtitles: ${OS_API_KEY ? 'Loaded' : 'MISSING'}`);
+
+  console.log(`✅ Torrentio: configured`);
+
+});
+
