@@ -1,5 +1,5 @@
-// server.js — Real-Debrid + OpenSubtitles (Arabic) + MySQL cache
-// الإصدار 7.1: يبحث بطرق متعددة (مع وبدون S01E01) + يدعم الأفلام بدون year
+// server.js — Real-Debrid + OpenSubtitles + 4 sources + smart filter
+// v7.2: + The Pirate Bay + smart title-match filter
 
 const express = require("express");
 const https = require("https");
@@ -104,6 +104,77 @@ function parseSize(sizeStr) {
 }
 
 // =============================================================
+// 🔑 فلتر ذكي: يتأكد إن الـ torrent فعلاً يطابق العنوان المطلوب
+// =============================================================
+function smartMatch(torrentName, displayTitle, year, isSeries, season, episode) {
+  const lower = torrentName.toLowerCase();
+  const titleLower = displayTitle.toLowerCase();
+
+  // 1) تقسيم العنوان لكلمات مفتاحية
+  // مثل "House of the Dragon" → ["house", "dragon"]
+  // مثل "The Matrix" → ["matrix"] (the شائعة)
+  const stopWords = new Set(['the', 'a', 'an', 'of', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'with', 'le', 'la', 'les', 'el', 'los', 'las', 'un', 'une', 'des', 'de']);
+  const titleWords = titleLower.split(/[\s\-_:.,()&]+/).filter(w => w.length >= 2 && !stopWords.has(w));
+  if (!titleWords.length) return true; // لو ما فهمنا العنوان، نقبل
+
+  // 2) لازم على الأقل 60% من الكلمات الرئيسية تكون في الـ torrent
+  // ما عدا الأسماء القصيرة جداً
+  let matchedWords = 0;
+  for (const w of titleWords) {
+    if (lower.includes(w)) matchedWords++;
+  }
+  const matchRatio = matchedWords / titleWords.length;
+
+  // للكلمة الواحدة (مثل "Michael" أو "Up")، لازم تطابق صريح + year
+  if (titleWords.length === 1) {
+    const w = titleWords[0];
+    if (!lower.includes(w)) return false;
+    if (year && !lower.includes(year)) return false;
+    // كلمات شائعة جداً — فلترة أكثر صرامة
+    const tooCommon = ['michael', 'david', 'john', 'love', 'star', 'the', 'life', 'man', 'woman', 'world', 'time', 'home', 'house', 'king', 'queen', 'one', 'two', 'three', 'war'];
+    if (tooCommon.includes(w)) {
+      // لازم يكون فيه كلمات إضافية مميزة في الـ torrent
+      const hasExtras = /(20\d{2}|19\d{2}|bluray|web-?dl|webrip|hdtv|dvdrip|hdrip|repack|proper|imax|extended|criterion)/i.test(lower);
+      if (!hasExtras) return false;
+    }
+    return true;
+  }
+
+  // للكلمات المتعددة: على الأقل 60% تطابق
+  if (matchRatio < 0.6) return false;
+
+  // 3) السنة: لو موجودة، يفصل بين 2022 و 2026
+  if (year) {
+    const yearInt = parseInt(year);
+    const torrentYearMatch = lower.match(/(19|20)(\d{2})/);
+    if (torrentYearMatch) {
+      const torrentYear = parseInt(torrentYearMatch[0]);
+      // نقبل ±2 سنة فقط
+      if (Math.abs(torrentYear - yearInt) > 2) return false;
+    }
+  }
+
+  // 4) للمسلسلات: نفضّل اللي فيها SxxExx
+  // (لكن ما نرفض بدونه لأن بعض الإصدارات الكاملة تحتويه)
+  return true;
+}
+
+function matchesEpisode(torrentName, season, episode) {
+  if (!season || !episode) return true;
+  const lower = torrentName.toLowerCase();
+  const sStr = String(season).padStart(2, '0');
+  const eStr = String(episode).padStart(2, '0');
+  // S01E05, S1E5, 1x05, Season 1 Episode 5
+  const patterns = [
+    new RegExp(`s0?${season}e0?${episode}(?!\\d)`, 'i'),
+    new RegExp(`${season}x0?${episode}(?!\\d)`, 'i'),
+    new RegExp(`s0?${season}\\b`, 'i'),
+    new RegExp(`season\\s*0?${season}\\b`, 'i'),
+  ];
+  return patterns.some(p => p.test(lower));
+}
+
+// =============================================================
 // SOURCES
 // =============================================================
 
@@ -158,13 +229,13 @@ async function searchTorrentDownloads(query) {
       });
     }
     const seen = new Set();
-    return results.filter(r => seen.has(r.url_path) ? false : (seen.add(r.url_path), true)).slice(0, 15);
+    return results.filter(r => seen.has(r.url_path) ? false : (seen.add(r.url_path), true)).slice(0, 20);
   } catch { return []; }
 }
 
 async function searchYTS(query, year) {
   try {
-    let url = `https://yts.mx/api/v2/list_movies.json?query_term=${encodeURIComponent(query)}&limit=10&sort_by=seeds&order_by=desc`;
+    let url = `https://yts.mx/api/v2/list_movies.json?query_term=${encodeURIComponent(query)}&limit=20&sort_by=seeds&order_by=desc`;
     if (year) url += `&year=${year}`;
     const response = await fetchURL(url, { timeout: 12000 });
     if (response.status !== 200 || !response.data?.data?.movies) return [];
@@ -207,7 +278,38 @@ async function search1337x(query) {
         size: 0, size_str: '', seeds: 0, source: '1337x',
       });
     }
-    return results.slice(0, 10);
+    return results.slice(0, 20);
+  } catch { return []; }
+}
+
+// 🆕 Pirate Bay — عنده محتوى أحدث
+async function searchPirateBay(query) {
+  try {
+    const url = `https://apibay.org/q.php?q=${encodeURIComponent(query)}&cat=200,201,202,203,204,205,206,207,208&sort=seeds&order=desc`;
+    const response = await fetchURL(url, { timeout: 15000 });
+    if (response.status !== 200) return [];
+    if (!Array.isArray(response.data)) return [];
+
+    const results = [];
+    for (const item of response.data) {
+      if (!item || item.id === '0' || !item.info_hash) continue;
+      const name = item.name || "";
+      const lower = name.toLowerCase();
+      const size = parseInt(item.size || 0);
+      results.push({
+        name,
+        title: name,
+        url_path: null,
+        magnet: `magnet:?xt=urn:btih:${item.info_hash}&dn=${encodeURIComponent(name)}&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://tracker.openbittorrent.com:80&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.torrent.eu.org:451/announce&tr=udp://exodus.desync.com:6969/announce&tr=udp://open.stealth.si:80/announce`,
+        quality: lower.includes('2160p') || lower.includes('4k') || lower.includes('uhd') ? '4K' :
+                lower.includes('1080p') || lower.includes('fhd') || lower.includes('bluray') ? '1080p' :
+                lower.includes('720p') ? '720p' : lower.includes('480p') ? '480p' : '?',
+        size, size_str: size > 0 ? `${(size/1024/1024/1024).toFixed(2)} GB` : '',
+        seeds: parseInt(item.seeders || 0),
+        source: 'piratebay',
+      });
+    }
+    return results.slice(0, 20);
   } catch { return []; }
 }
 
@@ -237,41 +339,44 @@ async function getMagnetFrom1337xPage(urlPath) {
   } catch { return null; }
 }
 
+// البحث المتوازي من 4 مصادر
 async function searchAllSources(query, type, year) {
-  let tdResults = [], ytsResults = [], xResults = [];
-  if (type === 'movie') {
-    [tdResults, ytsResults] = await Promise.all([searchTorrentDownloads(query), searchYTS(query, year)]);
-  } else {
-    [tdResults, xResults] = await Promise.all([searchTorrentDownloads(query), search1337x(query)]);
-  }
-  const results = [...ytsResults, ...xResults, ...tdResults];
-  if (results.length === 0) return [];
-  const needMagnet = results.filter(r => !r.magnet && r.url_path);
+  const promises = [
+    searchTorrentDownloads(query),
+    type === 'movie' ? searchYTS(query, year) : Promise.resolve([]),
+    search1337x(query),
+    searchPirateBay(query),
+  ];
+  const results = await Promise.all(promises);
+  const combined = [...results[0], ...results[1], ...results[2], ...results[3]];
+
+  if (combined.length === 0) return [];
+  const needMagnet = combined.filter(r => !r.magnet && r.url_path);
   if (needMagnet.length > 0) {
     await Promise.all(needMagnet.map(async (t) => {
-      const m = t.source === '1337x' ? await getMagnetFrom1337xPage(t.url_path) : await getMagnetFromTorrentPage(t.url_path);
+      const m = t.source === '1337x'
+        ? await getMagnetFrom1337xPage(t.url_path)
+        : await getMagnetFromTorrentPage(t.url_path);
       if (m) t.magnet = m;
     }));
   }
-  return results.filter(t => t.magnet);
+  return combined.filter(t => t.magnet);
 }
 
-// 🔑 دالة محسّنة: تبحث بطرق متعددة (مع/بدون S01E01، مع/بدون year)
+// بحث متعدد التركيبات + فلتر ذكي
 async function searchTorrentsMulti(displayTitle, type, sNum, eNum, year) {
   const queries = [];
 
   if (type === 'movie') {
-    // أفلام: نجرّب عدة تركيبات
     queries.push(year ? `${displayTitle} ${year}` : displayTitle);
     queries.push(displayTitle);
     if (year) queries.push(`${displayTitle} ${parseInt(year) - 1} ${parseInt(year) + 1}`);
   } else {
-    // مسلسلات: نجرّب مع وبدون S01E01
     const epTag = `S${String(sNum || 1).padStart(2, '0')}E${String(eNum || 1).padStart(2, '0')}`;
     queries.push(`${displayTitle} ${epTag}`);
-    queries.push(`${displayTitle} S${sNum || 1}E${eNum || 1}`); // بدون padding
+    queries.push(`${displayTitle} S${sNum || 1}E${eNum || 1}`);
     queries.push(`${displayTitle} ${epTag} ${year || ""}`.trim());
-    queries.push(displayTitle); // بدون S/E أبداً
+    queries.push(displayTitle);
   }
 
   let allTorrents = [];
@@ -287,9 +392,15 @@ async function searchTorrentsMulti(displayTitle, type, sNum, eNum, year) {
         allTorrents.push(t);
       }
     }
-    if (allTorrents.length >= 5) break; // عندنا كفاية
+    if (allTorrents.length >= 10) break;
   }
-  return allTorrents;
+
+  // 🆕 الفلتر الذكي: شيل اللي ما يطابق العنوان
+  const filtered = allTorrents.filter(t => smartMatch(t.name, displayTitle, year, type === 'tv', sNum, eNum));
+  console.log(`   📊 نتائج خام: ${allTorrents.length} | بعد الفلتر: ${filtered.length}`);
+
+  // لو الفلتر شال كل شي، نرجع الكل (كنسخة احتياطية)
+  return filtered.length > 0 ? filtered : allTorrents.slice(0, 5);
 }
 
 function getQualityScore(title) {
@@ -397,7 +508,6 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
     });
 
     if (searchRes.status !== 200 || !searchRes.data?.data?.length) return null;
-
     const candidates = searchRes.data.data.filter(s => s.attributes?.language === 'ar');
     if (!candidates.length) return null;
 
@@ -418,7 +528,6 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
     });
 
     if (dlRes.status !== 200 || !dlRes.data?.link) return null;
-
     const srtRes = await fetchURL(dlRes.data.link, { timeout: 15000 });
     if (srtRes.status !== 200 || !srtRes.data) return null;
 
@@ -427,11 +536,8 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
     const dataUrl = `data:text/plain;charset=utf-8;base64,${srtBase64}`;
 
     return {
-      url: dataUrl,
-      language: 'ar',
-      label: 'العربية',
-      source: 'opensubtitles',
-      release: top.attributes?.release || '',
+      url: dataUrl, language: 'ar', label: 'العربية',
+      source: 'opensubtitles', release: top.attributes?.release || '',
     };
   } catch (err) {
     console.warn('OS error:', err.message);
@@ -459,8 +565,7 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
       success: true,
       provider: `real-debrid+${cached.data.source || 'cache'}`,
       quality: cached.data.quality,
-      title: cached.data.title,
-      year: cached.data.year,
+      title: cached.data.title, year: cached.data.year,
       filename: cached.data.filename,
       stream_url: cached.data.stream_url,
       subtitle,
@@ -526,11 +631,10 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
   console.log(`\n🎬 ${displayTitle} (${year || "?"}) | ${type} S${sNum || 1}E${eNum || 1}`);
 
-  // 🔑 البحث الذكي بطرق متعددة
   const torrents = await searchTorrentsMulti(displayTitle, type, sNum, eNum, year);
 
   if (torrents.length === 0) {
-    return { success: false, error: `لم يتم العثور على "${displayTitle}" — جرب حلقة أو موسم ثاني` };
+    return { success: false, error: `لم يتم العثور على "${displayTitle}"` };
   }
 
   console.log(`📊 إجمالي النتائج: ${torrents.length} torrent`);
@@ -589,8 +693,7 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
       title: displayTitle, year,
       filename: torrentInfo.filename,
       stream_url: unrestricted.download,
-      subtitle,
-      subtitles: subtitle ? [subtitle.url] : [],
+      subtitle, subtitles: subtitle ? [subtitle.url] : [],
       size_mb: Math.round((bestSize || torrent.size || 0) / 1024 / 1024),
       seeds: torrent.seeds || 0,
       poster, backdrop, cached: false,
@@ -606,13 +709,10 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
 app.get("/api/subtitles", async (req, res) => {
   const { tmdb_id, type, season, episode, title, year } = req.query;
-  if (!tmdb_id && !title) {
-    return res.status(400).json({ success: false, error: "Missing tmdb_id or title" });
-  }
+  if (!tmdb_id && !title) return res.status(400).json({ success: false, error: "Missing tmdb_id or title" });
   try {
     const sub = await searchOpenSubtitles({
-      tmdbId: tmdb_id ? parseInt(tmdb_id) : null,
-      type, season, episode, title, year,
+      tmdbId: tmdb_id ? parseInt(tmdb_id) : null, type, season, episode, title, year,
     });
     if (!sub) return res.json({ success: false, error: "no_subtitles_found" });
     res.json({ success: true, subtitle: sub });
@@ -624,21 +724,13 @@ app.get("/api/subtitles", async (req, res) => {
 app.get("/api/play", async (req, res) => {
   const { id, type, season, episode, with_subs = '1' } = req.query;
   if (!id || !type) return res.status(400).json({ success: false, error: "Missing id or type" });
-
   req.setTimeout(300000);
   res.setTimeout(300000);
-
   const sNum = type === 'tv' ? parseInt(season || 1) : null;
   const eNum = type === 'tv' ? parseInt(episode || 1) : null;
-
   try {
-    const result = await tryGetStream({
-      id, type, sNum, eNum,
-      withSubs: with_subs === '1',
-    });
-    if (result.success) {
-      return res.json(result);
-    }
+    const result = await tryGetStream({ id, type, sNum, eNum, withSubs: with_subs === '1' });
+    if (result.success) return res.json(result);
     return res.status(404).json(result);
   } catch (err) {
     console.error("❌ Error:", err);
@@ -671,9 +763,9 @@ app.delete("/api/cache/:tmdb_id/:type", async (req, res) => {
 
 app.get("/", (req, res) => {
   res.json({
-    status: "✅ Real-Debrid + Arabic Subtitles API v7.1",
-    version: "7.1",
-    features: ["multi-query search", "smart TV matching", "arabic subtitles"],
+    status: "✅ Real-Debrid + Arabic Subtitles API v7.2",
+    version: "7.2",
+    features: ["4 sources (TD+YTS+1337x+TPB)", "smart title-match filter", "year filter", "arabic subtitles"],
     endpoints: {
       play: "/api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1&with_subs=1",
       subtitles: "/api/subtitles?tmdb_id=...&type=movie&title=...",
@@ -682,7 +774,7 @@ app.get("/", (req, res) => {
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🎬 BlueStream API v7.1 running on port ${PORT}`);
+  console.log(`\n🎬 BlueStream API v7.2 running on port ${PORT}`);
   console.log(`✅ RD Token: ${RD_TOKEN ? 'Loaded' : 'MISSING'}`);
   console.log(`✅ TMDB Key: ${TMDB_KEY ? 'Loaded' : 'MISSING'}`);
   console.log(`✅ OpenSubtitles: ${OS_API_KEY ? 'Loaded' : 'MISSING'}`);
