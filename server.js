@@ -391,23 +391,68 @@ function buildMagnet(infoHash, title, trackers) {
 }
 
 
+// 🔑 Browser-Playability Score: نرتب حسب اللي يشتغل في المتصفح
+
+//  - mp4 + x264/h264: ✅ يشتغل native (الأعلى أولوية)
+
+//  - mkv + hevc/x264: ⚠️ يحتاج transcoding (أولوية أقل)
+
+//  - webm: ✅ يشتغل في Chrome
+
 function getQualityScore(item) {
 
   const f = (item.name || item.title || "").toLowerCase();
 
-  if (f.includes('2160p') || f.includes('4k') || f.includes('uhd')) return 400;
 
-  if (f.includes('1080p') || f.includes('fhd') || f.includes('bluray') || f.includes('blu-ray')) return 300;
+  // نوع الملف (الأهم)
 
-  if (f.includes('remux')) return 350;
+  const isMp4 = f.includes('mp4') || (!f.includes('mkv') && !f.includes('remux') && !f.includes('avi'));
 
-  if (f.includes('720p') || f.includes('hdrip')) return 200;
+  const isMkv = f.includes('mkv') || f.includes('remux');
 
-  if (f.includes('480p') || f.includes('dvdrip')) return 100;
+  const isWebm = f.includes('webm');
 
-  if (f.includes('web-dl') || f.includes('webrip')) return 250;
 
-  return 50;
+  // الكوديك
+
+  const isHevc = f.includes('hevc') || f.includes('h.265') || f.includes('h265') || f.includes('x265') || f.includes('av1');
+
+  const isX264 = f.includes('x264') || f.includes('h.264') || f.includes('h264');
+
+
+  // الجودة
+
+  let resScore = 50;
+
+  if (f.includes('2160p') || f.includes('4k') || f.includes('uhd')) resScore = 400;
+
+  else if (f.includes('1080p') || f.includes('fhd')) resScore = 300;
+
+  else if (f.includes('720p') || f.includes('hdrip')) resScore = 200;
+
+  else if (f.includes('480p') || f.includes('dvdrip')) resScore = 100;
+
+
+  // playability bonus
+
+  let playBonus = 0;
+
+  if (isMp4 && isX264) playBonus = 1000;        // الأفضل: mp4 + x264
+
+  else if (isMp4 && !isHevc) playBonus = 800;   // mp4 + أي كوديك غير HEVC
+
+  else if (isWebm) playBonus = 600;
+
+  else if (isMkv && isX264) playBonus = 200;     // mkv + x264 (شغال في بعض المتصفحات)
+
+  else if (isMkv && isHevc) playBonus = -500;   // الأسوأ: mkv + HEVC (يحتاج transcoding)
+
+  // Remux دائماً HEVC → عقوبة كبيرة
+
+  if (f.includes('remux')) playBonus = Math.min(playBonus, -300);
+
+
+  return resScore + playBonus;
 
 }
 
