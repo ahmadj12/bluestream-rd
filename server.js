@@ -62,22 +62,22 @@ function fetchURL(url, options = {}) {
   });
 }
 
-// ====== TMDB Metadata ======
+// ====== TMDB Metadata مع جلب IMDb ID ======
 async function getTMDBMeta(id, type) {
   try {
     const path = type === 'movie' ? 'movie' : 'tv';
-    const response = await fetchURL(`https://api.themoviedb.org/3/${path}/${id}?api_key=${TMDB_KEY}&language=en-US`);
+    const response = await fetchURL(`https://api.themoviedb.org/3/${path}/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids&language=en-US`);
     return response.status === 200 ? response.data : null;
   } catch (err) {
     return null;
   }
 }
 
-// ====== جلب Magnet خارجي (Torrentio + Backup Scrap Search) ======
-async function fetchExternalMagnet(type, id, season, episode, meta) {
+// ====== جلب Magnet باستخدام IMDb ID ======
+async function fetchExternalMagnet(type, imdbId, season, episode) {
   try {
-    // 1. المحاولة الأولى: عبر TMDB ID المباشر
-    const queryPath = type === 'movie' ? `movie/${id}` : `series/${id}:${season}:${episode}`;
+    if (!imdbId) return null;
+    const queryPath = type === 'movie' ? `movie/${imdbId}` : `series/${imdbId}:${season}:${episode}`;
     const response = await fetchURL(`https://torrentio.strem.fun/stream/${queryPath}.json`);
     
     if (response.status === 200 && response.data?.streams?.length > 0) {
@@ -89,25 +89,6 @@ async function fetchExternalMagnet(type, id, season, episode, meta) {
         };
       }
     }
-
-    // 2. المحاولة الثانية الاحتياطية: بالاسم والسنة
-    const title = meta.title || meta.name;
-    const year = (meta.release_date || meta.first_air_date || '').slice(0, 4);
-    const searchQuery = type === 'movie' ? `${title} ${year}` : `${title} S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
-    
-    const searchUrl = `https://torrentio.strem.fun/stream/${type === 'movie' ? 'movie' : 'series'}/${encodeURIComponent(searchQuery)}.json`;
-    const backupRes = await fetchURL(searchUrl);
-
-    if (backupRes.status === 200 && backupRes.data?.streams?.length > 0) {
-      const stream = backupRes.data.streams.find(s => s.infoHash);
-      if (stream) {
-        return {
-          magnet: `magnet:?xt=urn:btih:${stream.infoHash}`,
-          quality: stream.name?.includes('4K') ? '4K' : '1080p'
-        };
-      }
-    }
-
     return null;
   } catch (err) {
     return null;
@@ -148,8 +129,11 @@ app.get("/api/play", async (req, res) => {
     const meta = await getTMDBMeta(id, type);
     if (!meta) return res.status(404).json({ success: false, error: "TMDB Meta not found" });
 
-    // جلب التورنت بالذكاء المزدوج
-    const streamData = await fetchExternalMagnet(type, id, season, episode, meta);
+    const imdbId = meta.external_ids?.imdb_id || meta.imdb_id;
+    if (!imdbId) return res.status(404).json({ success: false, error: "IMDb ID not found" });
+
+    // جلب التورنت باستخدام IMDb ID
+    const streamData = await fetchExternalMagnet(type, imdbId, season, episode);
     if (!streamData) return res.status(404).json({ success: false, error: "No torrent found" });
 
     // معالجة عبر Real-Debrid
