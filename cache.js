@@ -1,4 +1,7 @@
-// cache.js — MySQL cache layer
+// cache.js — MySQL cache with validation & invalidation
+
+// v2.0.0: إضافة invalidateEntry + setCache محسّن + timestamps
+
 
 const mysql = require('mysql2/promise');
 
@@ -6,363 +9,37 @@ const mysql = require('mysql2/promise');
 let pool = null;
 
 
-function buildConfig() {
-
-  const url = process.env.DATABASE_URL || process.env.MYSQL_URL;
-
-  if (url) {
-
-    try {
-
-      const parsed = new URL(url);
-
-      return {
-
-        host: parsed.hostname,
-
-        port: parseInt(parsed.port || '3306'),
-
-        user: parsed.username,
-
-        password: decodeURIComponent(parsed.password || ''),
-
-        database: parsed.pathname.replace(/^\//, '') || 'railway',
-
-      };
-
-    } catch (err) { /* fallthrough */ }
-
-  }
-
-  return {
-
-    host: process.env.DB_HOST || 'localhost',
-
-    port: parseInt(process.env.DB_PORT || '3306'),
-
-    user: process.env.DB_USER || 'root',
-
-    password: process.env.DB_PASS || process.env.MYSQL_ROOT_PASSWORD || '',
-
-    database: process.env.DB_NAME || process.env.MYSQLDATABASE || 'railway',
-
-  };
-
-}
-
-
 function initPool() {
 
   if (pool) return pool;
 
-  const base = buildConfig();
 
   pool = mysql.createPool({
 
-    ...base, waitForConnections: true, connectionLimit: 10, queueLimit: 0,
+    host: process.env.MYSQL_HOST || 'mysql.railway.internal',
 
-    charset: 'utf8mb4', timezone: '+00:00', enableKeepAlive: true,
+    port: Number(process.env.MYSQL_PORT || 3306),
+
+    user: process.env.MYSQL_USER || 'root',
+
+    password: process.env.MYSQL_PASSWORD || '',
+
+    database: process.env.MYSQL_DATABASE || 'railway',
+
+    waitForConnections: true,
+
+    connectionLimit: 10,
+
+    queueLimit: 0,
+
+    enableKeepAlive: true,
+
+    keepAliveInitialDelay: 10000,
 
   });
 
-  console.log(`✅ MySQL pool: ${base.user}@${base.host}:${base.port}/${base.database}`);
 
   return pool;
-
-}
-
-
-function buildKey(tmdbId, mediaType, season, episode) {
-
-  return {
-
-    tmdb_id: parseInt(tmdbId),
-
-    media_type: mediaType,
-
-    season: mediaType === 'tv' ? parseInt(season || 1) : null,
-
-    episode: mediaType === 'tv' ? parseInt(episode || 1) : null,
-
-  };
-
-}
-
-
-async function getCache(tmdbId, mediaType, season, episode) {
-
-  const p = initPool();
-
-  const key = buildKey(tmdbId, mediaType, season, episode);
-
-  try {
-
-    const [rows] = await p.execute(
-
-      `SELECT * FROM media_cache WHERE tmdb_id = ? AND media_type = ? AND season <=> ? AND episode <=> ? LIMIT 1`,
-
-      [key.tmdb_id, key.media_type, key.season, key.episode]
-
-    );
-
-    if (rows.length === 0) return { hit: false };
-
-    const row = rows[0];
-
-    await p.execute(
-
-      `UPDATE media_cache SET access_count = access_count + 1, last_accessed_at = NOW() WHERE id = ?`,
-
-      [row.id]
-
-    ).catch(() => {});
-
-    if (row.status === 'ready' && row.stream_url) {
-
-      const expiresAt = row.stream_url_expires_at ? new Date(row.stream_url_expires_at).getTime() : 0;
-
-      if (expiresAt > Date.now() + 60000) return { hit: true, fresh: true, data: row };
-
-      return { hit: true, fresh: false, data: row };
-
-    }
-
-    if (row.status === 'pending') return { hit: true, fresh: false, pending: true, data: row };
-
-    if (row.status === 'failed' && row.retry_count < 3) return { hit: true, fresh: false, retry: true, data: row };
-
-    if (row.status === 'error') return { hit: false, error: row.error_message };
-
-    return { hit: false, expired: true, data: row };
-
-  } catch (err) {
-
-    console.error('Cache get error:', err.message);
-
-    return { hit: false, dbError: err.message };
-
-  }
-
-}
-
-
-async function setCache(payload) {
-
-  const p = initPool();
-
-  const key = buildKey(payload.tmdb_id, payload.media_type, payload.season, payload.episode);
-
-  try {
-
-    let infoHash = payload.info_hash || null;
-
-    if (!infoHash && payload.magnet) {
-
-      const m = payload.magnet.match(/urn:btih:([a-fA-F0-9]{40})/i);
-
-      if (m) infoHash = m[1].toLowerCase();
-
-    }
-
-    const filename = payload.filename || '';
-
-    let videoFormat = payload.video_format || null;
-
-    if (!videoFormat) {
-
-      const fm = filename.match(/\.(mkv|mp4|avi|mov|wmv|flv|webm)$/i);
-
-      if (fm) videoFormat = fm[1].toLowerCase();
-
-    }
-
-    let videoCodec = payload.video_codec || null;
-
-    if (!videoCodec) {
-
-      const cm = filename.match(/\b(x\.?264|x\.?265|h\.?264|h\.?265|hevc|av1|xvid|divx)\b/i);
-
-      if (cm) videoCodec = cm[1].toLowerCase().replace(/\./g, '');
-
-    }
-
-    const sql = `
-
-      INSERT INTO media_cache (
-
-        tmdb_id, media_type, season, episode,
-
-        title, original_title, year, overview, poster_path, backdrop_path,
-
-        runtime, vote_average, genres,
-
-        rd_torrent_id, rd_link, stream_url, stream_url_expires_at,
-
-        filename, file_size_bytes, quality, video_format, video_codec, audio_codec,
-
-        source, magnet, info_hash, seeds,
-
-        status, error_message, retry_count,
-
-        fetched_at, refreshed_at
-
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NOW(), NOW())
-
-      ON DUPLICATE KEY UPDATE
-
-        title = VALUES(title), year = VALUES(year), overview = VALUES(overview),
-
-        poster_path = VALUES(poster_path), backdrop_path = VALUES(backdrop_path),
-
-        runtime = VALUES(runtime), vote_average = VALUES(vote_average), genres = VALUES(genres),
-
-        rd_torrent_id = VALUES(rd_torrent_id), rd_link = VALUES(rd_link),
-
-        stream_url = VALUES(stream_url), stream_url_expires_at = VALUES(stream_url_expires_at),
-
-        filename = VALUES(filename), file_size_bytes = VALUES(file_size_bytes),
-
-        quality = VALUES(quality), source = VALUES(source), magnet = VALUES(magnet),
-
-        info_hash = VALUES(info_hash), seeds = VALUES(seeds),
-
-        status = VALUES(status), error_message = VALUES(error_message),
-
-        refreshed_at = NOW(), retry_count = 0
-
-    `;
-
-    const expiresAt = new Date(Date.now() + 23 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ');
-
-    const params = [
-
-      key.tmdb_id, key.media_type, key.season, key.episode,
-
-      payload.title || null, payload.original_title || null,
-
-      payload.year ? parseInt(payload.year) : null,
-
-      payload.overview || null, payload.poster_path || null, payload.backdrop_path || null,
-
-      payload.runtime || null, payload.vote_average || null, payload.genres || null,
-
-      payload.rd_torrent_id || null, payload.rd_link || null,
-
-      payload.stream_url || null, payload.stream_url ? expiresAt : null,
-
-      payload.filename || null, payload.file_size_bytes || null,
-
-      payload.quality || null, videoFormat, videoCodec, payload.audio_codec || null,
-
-      payload.source || null, payload.magnet || null, infoHash,
-
-      payload.seeds || 0, payload.status || 'ready', payload.error_message || null,
-
-    ];
-
-    await p.execute(sql, params);
-
-    return { ok: true };
-
-  } catch (err) {
-
-    console.error('Cache set error:', err.message);
-
-    return { ok: false, error: err.message };
-
-  }
-
-}
-
-
-async function markFailed(tmdbId, mediaType, season, episode, errorMessage) {
-
-  const p = initPool();
-
-  const key = buildKey(tmdbId, mediaType, season, episode);
-
-  try {
-
-    await p.execute(
-
-      `INSERT INTO media_cache (tmdb_id, media_type, season, episode, status, error_message, retry_count)
-
-       VALUES (?, ?, ?, ?, 'failed', ?, 1)
-
-       ON DUPLICATE KEY UPDATE status = 'failed', error_message = VALUES(error_message), retry_count = retry_count + 1`,
-
-      [key.tmdb_id, key.media_type, key.season, key.episode, (errorMessage || 'unknown').substring(0, 500)]
-
-    );
-
-  } catch (err) { console.error('markFailed:', err.message); }
-
-}
-
-
-async function markPending(tmdbId, mediaType, season, episode) {
-
-  const p = initPool();
-
-  const key = buildKey(tmdbId, mediaType, season, episode);
-
-  try {
-
-    await p.execute(
-
-      `INSERT IGNORE INTO media_cache (tmdb_id, media_type, season, episode, status) VALUES (?, ?, ?, ?, 'pending')`,
-
-      [key.tmdb_id, key.media_type, key.season, key.episode]
-
-    );
-
-  } catch (err) { /* ignore */ }
-
-}
-
-
-async function getStats() {
-
-  const p = initPool();
-
-  try {
-
-    const [rows] = await p.execute(`
-
-      SELECT media_type, status, COUNT(*) AS count,
-
-        SUM(file_size_bytes) / 1024 / 1024 / 1024 AS total_gb,
-
-        AVG(access_count) AS avg_plays
-
-      FROM media_cache GROUP BY media_type, status ORDER BY media_type, status
-
-    `);
-
-    return rows;
-
-  } catch { return []; }
-
-}
-
-
-async function cleanExpired() {
-
-  const p = initPool();
-
-  try {
-
-    const [result] = await p.execute(`
-
-      UPDATE media_cache SET status = 'expired'
-
-      WHERE status = 'ready' AND stream_url_expires_at IS NOT NULL AND stream_url_expires_at < NOW()
-
-    `);
-
-    return result.affectedRows;
-
-  } catch { return 0; }
 
 }
 
@@ -371,110 +48,403 @@ async function runMigrations() {
 
   const p = initPool();
 
-  const statements = [
+  await p.execute(`
 
-    `CREATE TABLE IF NOT EXISTS media_cache (
+    CREATE TABLE IF NOT EXISTS media_cache (
 
-      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      id INT AUTO_INCREMENT PRIMARY KEY,
 
-      tmdb_id INT UNSIGNED NOT NULL,
+      tmdb_id INT NOT NULL,
 
-      media_type ENUM('movie', 'tv') NOT NULL,
+      media_type VARCHAR(10) NOT NULL,
 
-      season SMALLINT UNSIGNED DEFAULT NULL,
+      season INT NULL,
 
-      episode SMALLINT UNSIGNED DEFAULT NULL,
+      episode INT NULL,
 
-      title VARCHAR(255) NOT NULL,
+      title VARCHAR(500),
 
-      original_title VARCHAR(255) DEFAULT NULL,
+      year VARCHAR(10),
 
-      year SMALLINT DEFAULT NULL,
+      original_title VARCHAR(500),
 
-      overview TEXT DEFAULT NULL,
+      overview TEXT,
 
-      poster_path VARCHAR(255) DEFAULT NULL,
+      poster_path VARCHAR(255),
 
-      backdrop_path VARCHAR(255) DEFAULT NULL,
+      backdrop_path VARCHAR(255),
 
-      runtime SMALLINT UNSIGNED DEFAULT NULL,
+      runtime INT NULL,
 
-      vote_average DECIMAL(3,1) DEFAULT NULL,
+      vote_average DECIMAL(3,1) NULL,
 
-      genres VARCHAR(255) DEFAULT NULL,
+      genres VARCHAR(500),
 
-      rd_torrent_id VARCHAR(64) DEFAULT NULL,
+      rd_torrent_id VARCHAR(100),
 
-      rd_link VARCHAR(512) DEFAULT NULL,
+      rd_link TEXT,
 
-      stream_url TEXT DEFAULT NULL,
+      stream_url TEXT,
 
-      stream_url_expires_at DATETIME DEFAULT NULL,
+      stream_type VARCHAR(50),
 
-      filename VARCHAR(512) DEFAULT NULL,
+      filename VARCHAR(500),
 
-      file_size_bytes BIGINT UNSIGNED DEFAULT NULL,
+      file_size_bytes BIGINT,
 
-      quality VARCHAR(20) DEFAULT NULL,
+      quality VARCHAR(20),
 
-      video_format VARCHAR(50) DEFAULT NULL,
+      source VARCHAR(100),
 
-      video_codec VARCHAR(50) DEFAULT NULL,
+      magnet TEXT,
 
-      audio_codec VARCHAR(100) DEFAULT NULL,
+      seeds INT DEFAULT 0,
 
-      source VARCHAR(50) DEFAULT NULL,
+      info_hash VARCHAR(100),
 
-      magnet TEXT DEFAULT NULL,
+      status VARCHAR(20) DEFAULT 'ready',
 
-      info_hash CHAR(40) DEFAULT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
-      seeds INT UNSIGNED DEFAULT 0,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
-      status ENUM('pending', 'ready', 'expired', 'failed', 'error') NOT NULL DEFAULT 'pending',
+      expires_at TIMESTAMP NULL,
 
-      error_message VARCHAR(500) DEFAULT NULL,
+      INDEX idx_lookup (tmdb_id, media_type, season, episode),
 
-      retry_count TINYINT UNSIGNED DEFAULT 0,
+      INDEX idx_expires (expires_at)
 
-      access_count INT UNSIGNED DEFAULT 0,
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 
-      last_accessed_at DATETIME DEFAULT NULL,
+  `);
 
-      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+}
 
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
-      fetched_at DATETIME DEFAULT NULL,
+// TTL افتراضي: 30 يوم
 
-      refreshed_at DATETIME DEFAULT NULL,
+const DEFAULT_TTL_DAYS = 30;
 
-      PRIMARY KEY (id),
 
-      UNIQUE KEY unique_media (tmdb_id, media_type, season, episode),
+async function getCache(tmdbId, mediaType, season, episode) {
 
-      KEY idx_status (status),
+  try {
 
-      KEY idx_expires (stream_url_expires_at),
+    const p = initPool();
 
-      KEY idx_last_accessed (last_accessed_at),
+    const [rows] = await p.execute(
 
-      KEY idx_info_hash (info_hash)
+      `SELECT * FROM media_cache
 
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+       WHERE tmdb_id = ? AND media_type = ? AND season <=> ? AND episode <=> ?
 
-  ];
+       ORDER BY updated_at DESC LIMIT 1`,
 
-  for (const sql of statements) await p.query(sql);
+      [Number(tmdbId), String(mediaType), season ?? null, episode ?? null]
 
-  console.log('✅ Migrations: all tables ready');
+    );
+
+
+    if (!rows.length) {
+
+      return { hit: false, fresh: false, data: null };
+
+    }
+
+
+    const row = rows[0];
+
+    const now = new Date();
+
+    let fresh = true;
+
+
+    // التحقق من انتهاء الصلاحية
+
+    if (row.expires_at && new Date(row.expires_at) < now) {
+
+      fresh = false;
+
+    }
+
+
+    // التحقق من أن الـ stream_url ليس قديماً جداً (أكثر من 12 ساعة)
+
+    if (row.updated_at) {
+
+      const ageHours = (now - new Date(row.updated_at)) / (1000 * 60 * 60);
+
+      if (ageHours > 12) fresh = false;
+
+    }
+
+
+    return {
+
+      hit: true,
+
+      fresh,
+
+      data: row,
+
+    };
+
+  } catch (err) {
+
+    console.warn('cache.getCache error:', err.message);
+
+    return { hit: false, fresh: false, data: null };
+
+  }
+
+}
+
+
+async function setCache(data) {
+
+  try {
+
+    const p = initPool();
+
+
+    const expiresAt = new Date();
+
+    expiresAt.setDate(expiresAt.getDate() + DEFAULT_TTL_DAYS);
+
+
+    // الحقول المسموح بها
+
+    const allowed = {
+
+      tmdb_id: data.tmdb_id,
+
+      media_type: data.media_type,
+
+      season: data.season ?? null,
+
+      episode: data.episode ?? null,
+
+      title: data.title || null,
+
+      year: data.year || null,
+
+      original_title: data.original_title || null,
+
+      overview: data.overview || null,
+
+      poster_path: data.poster_path || null,
+
+      backdrop_path: data.backdrop_path || null,
+
+      runtime: data.runtime || null,
+
+      vote_average: data.vote_average || null,
+
+      genres: data.genres || null,
+
+      rd_torrent_id: data.rd_torrent_id || null,
+
+      rd_link: data.rd_link || null,
+
+      stream_url: data.stream_url || null,
+
+      stream_type: data.stream_type || null,
+
+      filename: data.filename || null,
+
+      file_size_bytes: data.file_size_bytes || null,
+
+      quality: data.quality || null,
+
+      source: data.source || null,
+
+      magnet: data.magnet || null,
+
+      seeds: data.seeds || 0,
+
+      info_hash: data.info_hash || null,
+
+      status: data.status || 'ready',
+
+      expires_at: expiresAt,
+
+    };
+
+
+    // بناء الاستعلام ديناميكياً
+
+    const fields = Object.keys(allowed);
+
+    const values = fields.map(f => allowed[f]);
+
+    const placeholders = fields.map(() => '?').join(', ');
+
+
+    const sql = `INSERT INTO media_cache (${fields.join(', ')}) VALUES (${placeholders})
+
+                 ON DUPLICATE KEY UPDATE
+
+                   title = VALUES(title),
+
+                   year = VALUES(year),
+
+                   original_title = VALUES(original_title),
+
+                   overview = VALUES(overview),
+
+                   poster_path = VALUES(poster_path),
+
+                   backdrop_path = VALUES(backdrop_path),
+
+                   runtime = VALUES(runtime),
+
+                   vote_average = VALUES(vote_average),
+
+                   genres = VALUES(genres),
+
+                   rd_torrent_id = VALUES(rd_torrent_id),
+
+                   rd_link = VALUES(rd_link),
+
+                   stream_url = VALUES(stream_url),
+
+                   stream_type = VALUES(stream_type),
+
+                   filename = VALUES(filename),
+
+                   file_size_bytes = VALUES(file_size_bytes),
+
+                   quality = VALUES(quality),
+
+                   source = VALUES(source),
+
+                   magnet = VALUES(magnet),
+
+                   seeds = VALUES(seeds),
+
+                   info_hash = VALUES(info_hash),
+
+                   status = VALUES(status),
+
+                   expires_at = VALUES(expires_at)`;
+
+
+    await p.execute(sql, values);
+
+    return true;
+
+  } catch (err) {
+
+    console.warn('cache.setCache error:', err.message);
+
+    return false;
+
+  }
+
+}
+
+
+async function invalidateEntry(tmdbId, mediaType, season, episode) {
+
+  try {
+
+    const p = initPool();
+
+    const [result] = await p.execute(
+
+      `DELETE FROM media_cache
+
+       WHERE tmdb_id = ? AND media_type = ? AND season <=> ? AND episode <=> ?`,
+
+      [Number(tmdbId), String(mediaType), season ?? null, episode ?? null]
+
+    );
+
+    return result.affectedRows;
+
+  } catch (err) {
+
+    console.warn('cache.invalidateEntry error:', err.message);
+
+    return 0;
+
+  }
+
+}
+
+
+async function getStats() {
+
+  try {
+
+    const p = initPool();
+
+    const [rows] = await p.query(`SELECT
+
+      COUNT(*) as total,
+
+      SUM(CASE WHEN status = 'ready' THEN 1 ELSE 0 END) as ready,
+
+      SUM(CASE WHEN expires_at IS NOT NULL AND expires_at < NOW() THEN 1 ELSE 0 END) as expired,
+
+      MAX(updated_at) as last_update
+
+    FROM media_cache`);
+
+
+    return rows[0] || {};
+
+  } catch (err) {
+
+    console.warn('cache.getStats error:', err.message);
+
+    return {};
+
+  }
+
+}
+
+
+async function cleanExpired() {
+
+  try {
+
+    const p = initPool();
+
+    const [result] = await p.execute(
+
+      `UPDATE media_cache SET status = 'expired' WHERE expires_at < NOW() AND status != 'expired'`
+
+    );
+
+    return result.affectedRows;
+
+  } catch (err) {
+
+    console.warn('cache.cleanExpired error:', err.message);
+
+    return 0;
+
+  }
 
 }
 
 
 module.exports = {
 
-  initPool, getCache, setCache, markFailed, markPending, getStats, cleanExpired, runMigrations,
+  initPool,
+
+  runMigrations,
+
+  getCache,
+
+  setCache,
+
+  invalidateEntry,
+
+  getStats,
+
+  cleanExpired,
 
 };
 
