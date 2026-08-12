@@ -1,0 +1,194 @@
+/* =====================================================
+   BlueStream — المشغل (player.css)
+   طبقة سينمائية + ثيم Video.js محايد مع توقيع هوية
+   ===================================================== */
+
+.player-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  display: flex; flex-direction: column; background: #000;
+}
+
+.player-topbar {
+  position: absolute; top: 0; inset-inline: 0; z-index: 10;
+  display: flex; align-items: center; gap: 18px; padding: 18px 28px;
+  background: linear-gradient(180deg, rgba(0,0,0,0.85) 0%, transparent 100%);
+  transition: opacity 0.4s ease;
+}
+.player-overlay.hide-chrome .player-topbar { opacity: 0; pointer-events: none; }
+
+.player-back {
+  padding: 9px 20px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+  background: rgba(9,9,11,0.6); color: var(--text);
+  font-family: inherit; font-size: 0.92rem; font-weight: 700; cursor: pointer;
+  transition: background var(--transition), border-color var(--transition);
+}
+.player-back:hover { background: var(--surface-2); border-color: var(--accent-border); }
+
+.player-title {
+  font-size: 1.1rem; font-weight: 800; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; text-shadow: 0 2px 8px rgba(0,0,0,0.8);
+}
+
+.player-stage { flex: 1; min-height: 0; display: grid; place-items: center; }
+.player-frame {
+  position: relative; width: min(100%, calc(100vh * 16 / 9));
+  aspect-ratio: 16/9; background: #000;
+}
+.player-frame .video-js { width: 100%; height: 100%; }
+
+/* ===== المؤشرات البصرية ===== */
+.player-feedback { pointer-events: none; }
+.fb {
+  position: absolute; z-index: 20; opacity: 0; color: var(--text);
+  background: rgba(9,9,11,0.65); backdrop-filter: blur(6px);
+  border: 1px solid var(--border-strong);
+}
+.fb.show { animation: fb-pop 0.65s ease forwards; }
+@keyframes fb-pop {
+  0%   { opacity: 0; transform: var(--fb-t, none) scale(0.8); }
+  18%  { opacity: 1; transform: var(--fb-t, none) scale(1.06); }
+  70%  { opacity: 1; transform: var(--fb-t, none) scale(1); }
+  100% { opacity: 0; transform: var(--fb-t, none) scale(1); }
+}
+.fb-seek {
+  --fb-t: translateY(-50%); top: 50%;
+  display: flex; align-items: center; gap: 10px; padding: 16px 26px;
+  border-radius: var(--radius-pill); font-size: 1.9rem;
+}
+.fb-seek span { font-size: 1.05rem; font-weight: 800; }
+#fb-seek-back { inset-inline-start: 10%; }
+#fb-seek-fwd  { inset-inline-end: 10%; }
+.fb-volume {
+  --fb-t: translateX(-50%); top: 10%; left: 50%;
+  padding: 10px 24px; border-radius: var(--radius-pill);
+  font-size: 1.05rem; font-weight: 800;
+}
+.fb-play {
+  --fb-t: translate(-50%,-50%); top: 50%; left: 50%;
+  display: grid; place-items: center; width: 104px; height: 104px;
+  border-radius: 50%; font-size: 2.4rem;
+}
+
+/* ===== رسالة الخطأ ===== */
+.player-error {
+  position: absolute; inset: 0; z-index: 30;
+  display: grid; place-items: center; padding: 24px;
+  background: rgba(3,6,12,0.86); backdrop-filter: blur(8px);
+}
+.player-error-card {
+  max-width: 420px; text-align: center; padding: 34px 30px;
+  border-radius: 18px; background: var(--surface);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 24px 60px rgba(0,0,0,0.7);
+  animation: pop 0.28s cubic-bezier(0.2,0.9,0.3,1.2);
+}
+/* أيقونة الخطأ: نقطة هوية مركزية + توهج */
+.player-error-icon {
+  width: 62px; height: 62px; margin: 0 auto 18px;
+  display: grid; place-items: center; font-size: 1.9rem; border-radius: 50%;
+  color: var(--text); background: var(--surface-2);
+  border: 1px solid var(--accent-border);
+  box-shadow: var(--accent-glow);
+}
+.player-error-card p { font-size: 1.02rem; line-height: 1.8; color: var(--text); margin-bottom: 24px; }
+.player-error-actions { display: flex; gap: 12px; justify-content: center; }
+.player-error-actions .btn-play,
+.player-error-actions .btn-info { padding: 11px 26px; font-size: 0.95rem; }
+
+/* ===== تسمية زر الترجمة ===== */
+.vjs-subtitle-toggle { width: auto !important; padding: 0 0.5em; }
+.vjs-subtitle-toggle .vjs-icon-placeholder::before { content: "💬"; font-size: 1.5em; line-height: 2.4; }
+.vjs-subtitle-toggle .vjs-sub-label {
+  font-family: "Cairo", sans-serif; font-size: 1.05em; font-weight: 700;
+  margin-inline-start: 0.35em; vertical-align: middle;
+}
+
+/* ===== ثيم Video.js ===== */
+.video-js { font-size: 13px; }
+.video-js .vjs-control-bar {
+  display: flex; flex-wrap: wrap; align-items: center; height: auto;
+  padding: 0 1.4em 0.7em;
+  background: linear-gradient(to top, rgba(0,0,0,0.95) 0%, rgba(0,0,0,0.55) 65%, transparent 100%);
+}
+.video-js .vjs-progress-control { order: 0; flex: 0 0 100%; width: 100%; height: 2em; }
+.video-js .vjs-control-bar > .vjs-control:not(.vjs-progress-control) { order: 1; }
+
+.video-js .vjs-progress-holder { height: 0.45em; border-radius: 999px; transition: height 0.15s ease; }
+.video-js .vjs-progress-control:hover .vjs-progress-holder { height: 0.85em; }
+.video-js .vjs-play-progress, .video-js .vjs-load-progress, .video-js .vjs-load-progress div { border-radius: 999px; }
+/* شريط التقدم — لون هوية + توهج */
+.video-js .vjs-play-progress { background: var(--accent-solid); }
+.video-js .vjs-play-progress::before { font-size: 1em; color: var(--accent-solid); top: 50%; transform: translateY(-50%); text-shadow: 0 0 10px var(--accent-glow-near); }
+.video-js .vjs-slider { background-color: rgba(255,255,255,0.16); }
+.video-js .vjs-load-progress div { background: rgba(255,255,255,0.3); }
+.video-js .vjs-volume-level { background-color: var(--accent-solid); }
+
+.video-js .vjs-control { width: 3.8em; height: 3.6em; }
+.video-js .vjs-button > .vjs-icon-placeholder::before { font-size: 2em; line-height: 1.8; transition: transform 0.15s ease; }
+.video-js .vjs-button:hover > .vjs-icon-placeholder::before { transform: scale(1.18); }
+.video-js .vjs-time-control { line-height: 3.6em; font-size: 1.05em; font-weight: 600; padding: 0 0.5em; }
+.video-js .vjs-playback-rate .vjs-playback-rate-value { line-height: 3.6em; font-size: 1.35em; font-weight: 700; }
+.video-js .vjs-volume-panel { align-items: center; }
+.video-js .vjs-volume-bar { margin: 1.7em 0.45em; }
+
+.video-js .vjs-big-play-button {
+  width: 2.4em; height: 2.4em; line-height: 2.3em; font-size: 2.8em;
+  border-radius: 50%; border: 2px solid var(--border-strong);
+  background-color: rgba(9,9,11,0.75);
+}
+.video-js:hover .vjs-big-play-button, .video-js .vjs-big-play-button:focus {
+  background-color: var(--surface-2); border-color: var(--accent-border);
+}
+.video-js .vjs-loading-spinner { border-color: rgba(255,255,255,0.18); }
+.video-js .vjs-loading-spinner::before, .video-js .vjs-loading-spinner::after { border-top-color: var(--accent-solid); }
+
+.vjs-skip-btn .vjs-icon-placeholder::before { content: ""; }
+.vjs-skip-back .vjs-icon-placeholder::before { content: "↺"; }
+.vjs-skip-forward .vjs-icon-placeholder::before { content: "↻"; }
+.vjs-ep-btn .vjs-icon-placeholder::before { font-size: 1.7em !important; line-height: 2.15 !important; }
+.vjs-ep-prev .vjs-icon-placeholder::before { content: "⏮"; }
+.vjs-ep-next .vjs-icon-placeholder::before { content: "⏭"; }
+.video-js .vjs-control.vjs-disabled { opacity: 0.35; }
+
+.vjs-quality-selector .vjs-icon-placeholder {
+  font-family: inherit !important; font-weight: 800; font-size: 0.92em; line-height: 3.95; letter-spacing: 0.4px;
+}
+.vjs-quality-selector .vjs-icon-placeholder::before { content: "⚙ " !important; font-size: 1.2em; position: static !important; vertical-align: -1px; }
+
+.video-js .vjs-menu-content { background: rgba(9,9,11,0.96); border: 1px solid var(--border-strong); border-radius: 8px; }
+.video-js .vjs-menu li { padding: 0.5em 1em; font-size: 1.05em; }
+.video-js .vjs-menu li.vjs-selected, .video-js .vjs-menu li.vjs-selected:focus, .video-js .vjs-menu li.vjs-selected:hover {
+  background-color: var(--accent-solid); color: #000;
+}
+.video-js .vjs-menu li:focus, .video-js .vjs-menu li:hover { background-color: var(--surface-3); color: var(--text); }
+.video-js .vjs-text-track-display div { font-family: "Cairo", sans-serif !important; }
+.video-js .vjs-time-tooltip, .video-js .vjs-mouse-display .vjs-time-tooltip {
+  background: rgba(9,9,11,0.9); color: var(--text); border-radius: 6px;
+  font-family: "Cairo", sans-serif; font-weight: 700; padding: 4px 8px;
+}
+
+/* ===== استجابة ===== */
+@media (max-width: 1000px) {
+  :root { --side-pad: 24px; }
+  .main-nav { gap: 0; }
+  .nav-link { padding: 8px 10px; font-size: 0.88rem; }
+}
+@media (max-width: 680px) {
+  :root { --side-pad: 16px; }
+  .topbar { flex-wrap: wrap; gap: 12px; padding-block: 10px; }
+  .brand { font-size: 1.15rem; }
+  .search-wrap { width: 150px; }
+  .main-nav { order: 3; flex-basis: 100%; justify-content: center; }
+  .hero { min-height: 64vh; }
+  .hero-content { padding-bottom: 70px; }
+  .card, .skeleton { flex-basis: 138px; width: 138px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(130px,1fr)); gap: 10px; }
+  .page-section { padding-top: 130px; }
+  .modal-hero-content h2 { font-size: 1.25rem; }
+  .modal-content { padding: 18px 16px 22px; }
+  .episode-thumb { flex-basis: 110px; }
+  .episode-num { display: none; }
+  .episode-desc { -webkit-line-clamp: 1; }
+  .video-js { font-size: 10px; }
+  .fb-seek { padding: 12px 18px; font-size: 1.4rem; }
+}

@@ -690,24 +690,44 @@ function allAudioTracks(mediaInfo) {
 function getAudioCompatibility({ filename = '', mediaInfo = null } = {}) {
   const name = String(filename).toLowerCase();
   const tracks = allAudioTracks(mediaInfo);
-  const first = tracks[0] || null;
-  const codec = normalizeCodec(first?.codec);
 
-  const explicitGood = /(aac|mp4a|he-aac|lc-aac|\bmp3\b)/i.test(name);
+  const explicitGood = /(aac|mp4a|he-aac|lc-aac|\bmp3\b|opus)/i.test(name);
   const explicitBad = /(truehd|dts[- .]?hd|\bdts\b|eac3|e-ac-3|\bac3\b|\bddp\b|dolby[ .-]?digital|\batmos\b|flac)/i.test(name);
 
-  const goodCodec = /^(aac|mp3|opus|mp4a)/.test(codec);
-  const badCodec = /^(ac3|eac3|ec3|ddp|dolbydigital|truehd|dts|dtshd|flac)/.test(codec);
+  let bestScore = -10000;
+  let bestCodec = null;
+  let anyGood = false;
+  let anyUnknown = false;
 
-  if (goodCodec || explicitGood) {
-    return { score: 1200, incompatible: false, codec: codec || null };
+  for (const track of tracks) {
+    const codec = normalizeCodec(track.codec);
+    if (/^(aac|mp3|opus|mp4a)/.test(codec)) {
+      anyGood = true;
+      bestScore = Math.max(bestScore, 1200);
+      bestCodec = bestCodec || codec;
+    } else if (/^(ac3|eac3|ec3|ddp|dolbydigital|truehd|dts|dtshd|flac)/.test(codec)) {
+      bestScore = Math.max(bestScore, -3000);
+      bestCodec = bestCodec || codec;
+    } else {
+      anyUnknown = true;
+      bestScore = Math.max(bestScore, 0);
+      bestCodec = bestCodec || codec;
+    }
   }
 
-  if (badCodec || explicitBad) {
-    return { score: -3000, incompatible: true, codec: codec || null };
+  if (explicitGood || anyGood) {
+    return { score: 1200, incompatible: false, codec: bestCodec || null };
   }
 
-  return { score: 0, incompatible: false, codec: codec || null };
+  if (explicitBad && !anyGood) {
+    return { score: -3000, incompatible: true, codec: bestCodec || null };
+  }
+
+  if (bestScore < 0) {
+    return { score: bestScore, incompatible: true, codec: bestCodec || null };
+  }
+
+  return { score: 0, incompatible: false, codec: bestCodec || null };
 }
 
 
@@ -1373,15 +1393,18 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
       ? searchRes.data.data
       : [];
 
-    let candidates = results.filter(s => s.attributes?.language === 'ar' && s.attributes?.files?.length);
+    let candidates = results.filter(s => Array.isArray(languages)
+      ? languages.includes(s.attributes?.language) && s.attributes?.files?.length
+      : s.attributes?.language === languages && s.attributes?.files?.length);
 
     // Fallback: some titles have imperfect TMDB linkage in OpenSubtitles.
     // Retry by title/year for movies or by title for TV if the exact TMDB lookup is empty.
     if (!candidates.length && title) {
       const fallbackQuery = encodeURIComponent(year ? `${title} ${year}` : title);
+      const fallbackLanguages = Array.isArray(languages) && languages.includes('ar') ? ['en'] : ['ar'];
       const fallbackUrl =
         `${OS_BASE}/subtitles?query=${fallbackQuery}` +
-        `&languages=ar` +
+        `&languages=${fallbackLanguages.join(',')}` +
         `&order_by=download_count` +
         `&order_direction=desc`;
 
@@ -1404,7 +1427,6 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
     if (!candidates.length) return null;
 
     const top = candidates[0];
-
     const fileId = top.attributes?.files?.[0]?.file_id;
 
     if (!fileId) return null;
@@ -1448,10 +1470,13 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
     const subtitleBase64 = Buffer.from(webvtt, 'utf8').toString('base64');
     const dataUrl = `data:text/vtt;charset=utf-8;base64,${subtitleBase64}`;
 
+    const language = top.attributes?.language || 'ar';
+    const label = language === 'ar' ? 'العربية' : (language === 'en' ? 'English' : language);
+
     return {
       url: dataUrl,
-      language: 'ar',
-      label: 'العربية',
+      language,
+      label,
       source: 'opensubtitles',
       format: 'vtt',
       release: top.attributes?.release || '',
@@ -1509,7 +1534,7 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
         year: cached.data.year,
         filename: playable.filename || cached.data.filename,
         stream_url: playable.type === "mp4" ? makeStreamProxyUrl({ id, type, season: sNum, episode: eNum }) : playable.url,
-        stream_type: playable.type === "mp4" ? "mp4-proxy" : playable.type,
+        stream_type: "mp4",
         subtitle,
         subtitles: subtitle ? [subtitle.url] : [],
         size_mb: Math.round((playable.filesize || cached.data.file_size_bytes || 0) / 1024 / 1024),

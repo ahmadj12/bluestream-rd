@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ahmad says hi — أفلام ومسلسلات وأنمي</title>
+  <meta name="description" content="اكتشف الأفلام والمسلسلات والأنمي وابحث فيها بذكاء" />
+  <link rel="icon" type="image/png" href="assets/icon.png" />
+
+  <!-- Preconnect للموارد الخارجية -->
+  <link rel="preconnect" href="https://api.themoviedb.org" />
+  <link rel="preconnect" href="https://image.tmdb.org" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="preconnect" href="https://api.jikan.moe" />
+  <link rel="preconnect" href="https://api.opensubtitles.com" />
+
+  <!-- الخطوط — Cairo: هندسي عربي بأوزان حتى 900 -->
+  <link
+    href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;500;700;800;900&display=swap"
+    rel="stylesheet"
+  />
+
+  <!-- Video.js CSS -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/video.js@7.21.6/dist/video-js.min.css" />
+
+  <!-- CSS مخصص -->
+  <link rel="stylesheet" href="css/theme.css?v=20260811-admin4" />
+  <link rel="stylesheet" href="css/style.css?v=20260811-admin4" />
+  <link rel="stylesheet" href="css/components.css?v=20260811-admin4" />
+  <link rel="stylesheet" href="css/player.css?v=20260811-admin4" />
+  <link rel="stylesheet" href="css/embed-player.css?v=20260811-admin4" />
+  <link rel="stylesheet" href="css/admin.css?v=20260811-admin4" />
+</head>
+<body class="app-locked">
+
+  <!-- ===== شاشة التحميل ===== -->
+  <div id="boot-screen" class="boot-screen">
+    <div class="boot-spinner"></div>
+    <p>جارِ التحميل...</p>
+  </div>
+
+  <!-- ===== بوابة الحساب واختيار الملف ===== -->
+  <div id="access-gate" class="access-gate">
+    <div class="access-gate-glow" aria-hidden="true"></div>
+    <section class="access-gate-card" aria-live="polite">
+      <div class="access-gate-brand">
+        <span>▶</span>
+        <strong>ahmad <b>says hi</b></strong>
+      </div>
+
+      <div id="gate-loading" class="gate-state">
+        <div class="gate-spinner"></div>
+        <h1>جارِ التحقق من حسابك</h1>
+        <p>لحظة واحدة فقط...</p>
+      </div>
+
+      <div id="gate-auth" class="gate-state hidden">
+        <span class="gate-eyebrow">حساب واحد · حتى 10 ملفات</span>
+        <h1>سجّل دخولك للمتابعة</h1>
+        <p>تقدم المشاهدة وقائمتك وسجلك تبقى منفصلة ومحفوظة لكل ملف.</p>
+        <div class="gate-auth-actions">
+          <button id="gate-login" class="gate-primary" type="button">تسجيل الدخول</button>
+          <button id="gate-register" class="gate-secondary" type="button">إنشاء حساب جديد</button>
+        </div>
+        <small>التشغيل المحلي الكامل يتم من ملف Start-Ahmad-Says-Hi.bat.</small>
+      </div>
+
+      <div id="gate-profiles" class="gate-state hidden">
+        <span class="gate-eyebrow">اختر ملفك</span>
+        <h1>من يشاهد الآن؟</h1>
+        <p id="gate-account-email" class="gate-account-email"></p>
+        <div id="gate-profile-list" class="gate-profile-list"></div>
+        <div class="gate-profile-actions">
+          <button id="gate-manage-profiles" class="gate-secondary" type="button">إدارة وتعديل الملفات</button>
+          <button id="gate-logout" class="gate-text-button" type="button">تسجيل الخروج</button>
+        </div>
+      </div>
+
+      <div id="gate-renewal" class="gate-state hidden">
+        <span class="gate-eyebrow">تجديد الاشتراك</span>
+        <h1>انتهى اشتراكك</h1>
+        <p>أدخل رمز تفعيل جديداً لاستعادة الملفات والمزامنة فوراً.</p>
+        <p id="gate-renewal-email" class="gate-account-email"></p>
+        <form id="gate-renewal-form" class="gate-renewal-form">
+          <label class="field-label" for="gate-renewal-code">رمز التفعيل</label>
+          <input id="gate-renewal-code" class="form-input activation-code-input" autocomplete="one-time-code" required />
+          <p id="gate-renewal-error" class="form-error hidden" role="alert"></p>
+          <button id="gate-renewal-submit" class="gate-primary" type="submit">تجديد الاشتراك</button>
+        </form>
+        <button id="gate-renewal-logout" class="gate-text-button" type="button">تسجيل الخروج</button>
+      </div>
+
+      <div id="gate-suspended" class="gate-state hidden">
+        <span class="gate-eyebrow">الحساب موقوف</span>
+        <h1>تعذّر فتح هذا الحساب</h1>
+        <p>تم إلغاء جميع الجلسات. تواصل مع الدعم إذا كنت تعتقد أن الإيقاف غير صحيح.</p>
+        <p id="gate-suspended-email" class="gate-account-email"></p>
+        <div class="gate-auth-actions">
+          <a class="gate-secondary gate-support-link" href="mailto:ahmadaljohani16@gmail.com">التواصل مع الدعم</a>
+          <button id="gate-suspended-logout" class="gate-text-button" type="button">استخدام حساب آخر</button>
+        </div>
+      </div>
+
+      <div id="gate-offline" class="gate-state hidden">
+        <span class="gate-eyebrow">الاتصال مطلوب</span>
+        <h1>تعذّر الوصول إلى الحساب</h1>
+        <p>يلزم اتصال بالخدمة لتسجيل الدخول قبل فتح الموقع.</p>
+        <p id="gate-offline-message" class="gate-offline-message"></p>
+        <div class="gate-auth-actions">
+          <button id="gate-retry" class="gate-primary" type="button">إعادة الاتصال</button>
+          <button id="gate-offline-logout" class="gate-secondary" type="button">استخدام حساب آخر</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- ===== الهيدر ===== -->
+  <header class="topbar" id="topbar">
+    <div class="brand">
+      <span class="brand-icon">▶</span>
+      <span class="brand-name">ahmad<b> says hi</b></span>
+    </div>
+
+    <nav class="main-nav" id="main-nav">
+      <button class="nav-link active" data-view="home">الرئيسية</button>
+      <button class="nav-link" data-view="movies">أفلام</button>
+      <button class="nav-link" data-view="tv">مسلسلات</button>
+      <button class="nav-link" data-view="anime">أنمي</button>
+    </nav>
+
+    <div class="header-actions">
+      <div class="search-wrap">
+        <input
+          type="search"
+          id="search-input"
+          class="search-input"
+          placeholder="ابحث باسم عمل أو تصنيف..."
+          autocomplete="off"
+        />
+        <span class="search-icon">⌕</span>
+      </div>
+
+      <div class="profile-menu-wrap">
+        <button
+          id="profile-trigger"
+          class="profile-trigger"
+          type="button"
+          aria-haspopup="menu"
+          aria-expanded="false"
+        >
+          <span id="header-profile-avatar" class="profile-avatar profile-avatar-sm"></span>
+          <span id="header-profile-name" class="profile-trigger-name">الملف الرئيسي</span>
+          <span class="profile-trigger-chevron" aria-hidden="true">⌄</span>
+        </button>
+
+        <div id="profile-dropdown" class="profile-dropdown hidden" role="menu">
+          <div class="profile-dropdown-head">
+            <div>
+              <strong>من يشاهد الآن؟</strong>
+              <span id="profile-account-label">محفوظ محلياً</span>
+            </div>
+            <span id="profile-sync-dot" class="sync-dot" title="حالة المزامنة"></span>
+          </div>
+          <div id="profile-switcher" class="profile-switcher"></div>
+          <div class="profile-menu-divider"></div>
+          <button class="profile-menu-item" type="button" data-library-view="my-list">
+            <span aria-hidden="true">＋</span> قائمتي
+          </button>
+          <button class="profile-menu-item" type="button" data-library-view="watched">
+            <span aria-hidden="true">✓</span> تمت المشاهدة
+          </button>
+          <button class="profile-menu-item" type="button" data-library-view="history">
+            <span aria-hidden="true">↶</span> سجل المشاهدة
+          </button>
+          <button id="manage-profiles" class="profile-menu-item" type="button">
+            <span aria-hidden="true">⚙</span> إدارة الملفات
+          </button>
+          <button id="open-admin" class="profile-menu-item admin-menu-item hidden" type="button">
+            <span aria-hidden="true">◆</span> لوحة الإدارة
+          </button>
+          <div class="profile-menu-divider"></div>
+          <button id="profile-auth-action" class="profile-menu-item profile-auth-action" type="button">
+            تسجيل الدخول والمزامنة
+          </button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="app">
+
+    <!-- نتائج البحث -->
+    <section id="search-results" class="page-section hidden">
+      <h2 class="row-title" id="search-title" aria-live="polite">نتائج البحث</h2>
+      <div class="grid" id="search-grid"></div>
+    </section>
+
+    <!-- ===== الرئيسية: هيرو + صفوف ===== -->
+    <div id="view-home">
+
+      <!-- الهيرو (Billboard) -->
+      <section id="hero" class="hero">
+        <div class="hero-backdrop">
+          <img id="hero-backdrop" src="" alt="" />
+        </div>
+        <div class="hero-content">
+          <h1 id="hero-title"></h1>
+          <div class="hero-meta">
+            <span id="hero-rating" class="hero-badge">★ —</span>
+            <span id="hero-year" class="hero-badge"></span>
+            <span id="hero-type" class="hero-badge hero-badge-type"></span>
+          </div>
+          <p id="hero-overview"></p>
+          <div class="hero-actions">
+            <button id="hero-play" class="btn-play">▶&nbsp;&nbsp;تشغيل</button>
+            <button id="hero-info" class="btn-info">ⓘ&nbsp;&nbsp;التفاصيل</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- الصفوف -->
+      <div class="rows-wrap">
+        <section class="row-section hidden" id="continue-section">
+          <h2 class="row-title">متابعة المشاهدة</h2>
+          <div class="row-scroller" id="row-continue"></div>
+        </section>
+
+        <section class="row-section">
+          <h2 class="row-title">الرائج اليوم</h2>
+          <div class="row-scroller" id="row-trending"></div>
+        </section>
+
+        <section class="row-section">
+          <h2 class="row-title">أعلى الأفلام تقييماً</h2>
+          <div class="row-scroller" id="row-top-movies"></div>
+        </section>
+
+        <section class="row-section">
+          <h2 class="row-title">أنمي شائع</h2>
+          <div class="row-scroller" id="row-anime"></div>
+        </section>
+      </div>
+    </div>
+
+    <!-- ===== صفحة تصنيف ===== -->
+    <div id="view-category" class="page-section hidden">
+      <h2 class="row-title" id="category-title"></h2>
+      <div class="grid" id="category-grid"></div>
+      <div class="load-more-wrap">
+        <button id="load-more" class="btn-more">تحميل المزيد</button>
+      </div>
+    </div>
+
+    <!-- ===== صفحات بيانات الملف الشخصي ===== -->
+    <section id="profile-library-view" class="page-section hidden">
+      <div class="library-page-head">
+        <div>
+          <span id="library-eyebrow" class="library-eyebrow">ملفك الشخصي</span>
+          <h2 id="library-title" class="row-title">قائمتي</h2>
+          <p id="library-description" class="library-description"></p>
+        </div>
+        <button id="library-close" class="btn-info library-close" type="button">العودة</button>
+      </div>
+      <div id="library-grid" class="grid"></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    بيانات المسلسلات الإضافية مقدمة من
+    <a href="https://www.tvmaze.com/" target="_blank" rel="noopener noreferrer">TVMaze</a>
+  </footer>
+
+  <!-- ===== نافذة التفاصيل ===== -->
+  <div id="details-modal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-close></div>
+    <div class="modal-card">
+      <button class="modal-close" data-close aria-label="إغلاق">✕</button>
+
+      <div class="modal-hero">
+        <img id="modal-backdrop" src="" alt="" />
+        <div class="modal-hero-grad"></div>
+        <div class="modal-hero-content">
+          <h2 id="modal-title"></h2>
+          <div class="modal-meta">
+            <span id="modal-rating" class="badge badge-rating"></span>
+            <span id="modal-year" class="badge"></span>
+            <span id="modal-type" class="badge badge-type"></span>
+          </div>
+          <div class="modal-primary-actions">
+            <button id="modal-play" class="btn-play">▶&nbsp;&nbsp;تشغيل</button>
+            <button id="modal-my-list" class="btn-info modal-list-action" type="button">
+              ＋ قائمتي
+            </button>
+            <button id="modal-watched" class="btn-info modal-list-action" type="button">
+              ✓ تمت المشاهدة
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-content">
+        <p id="modal-overview" class="modal-overview"></p>
+        <p id="modal-notice" class="modal-notice hidden"></p>
+        <div id="watch-options" class="watch-options hidden" aria-live="polite"></div>
+
+        <div id="episodes-block" class="episodes-block hidden">
+          <div class="episodes-head">
+            <h3>الحلقات</h3>
+            <select id="season-select" class="season-select"></select>
+          </div>
+          <div id="episodes-list" class="episodes-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== إدارة الملفات الشخصية ===== -->
+  <div id="profiles-modal" class="modal profiles-modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-profiles-close></div>
+    <div class="profiles-dialog" role="dialog" aria-modal="true" aria-labelledby="profiles-title">
+      <button class="modal-close" type="button" data-profiles-close aria-label="إغلاق">✕</button>
+      <div class="profiles-dialog-head">
+        <span class="dialog-kicker">حتى 10 ملفات</span>
+        <h2 id="profiles-title">إدارة الملفات الشخصية</h2>
+        <p>لكل ملف تقدمه وقائمته وسجله الخاص، مع مزامنة سحابية عند تسجيل الدخول.</p>
+      </div>
+
+      <div id="profiles-manager-grid" class="profiles-manager-grid"></div>
+      <button id="add-profile" class="add-profile-button" type="button">
+        <span>＋</span>
+        إضافة ملف جديد
+      </button>
+
+      <form id="profile-editor" class="profile-editor hidden">
+        <div class="profile-editor-preview">
+          <span id="profile-editor-avatar" class="profile-avatar profile-avatar-xl"></span>
+          <div>
+            <h3 id="profile-editor-title">ملف جديد</h3>
+            <p>اختر صورة جاهزة أو ارفع صورتك بعد ضغطها تلقائياً.</p>
+          </div>
+        </div>
+
+        <label class="field-label" for="profile-name-input">اسم الملف</label>
+        <input id="profile-name-input" class="form-input" maxlength="30" required />
+
+        <span class="field-label">صورة جاهزة</span>
+        <div id="avatar-presets" class="avatar-presets"></div>
+
+        <div class="profile-upload-row">
+          <input id="profile-avatar-file" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" />
+          <button id="choose-profile-avatar" class="btn-info" type="button">رفع صورة</button>
+          <small>تُقص إلى 256×256 وتُحفظ WebP تلقائياً.</small>
+        </div>
+
+        <p id="profile-editor-error" class="form-error hidden" role="alert"></p>
+        <div class="profile-editor-actions">
+          <button id="save-profile" class="btn-play" type="submit">حفظ الملف</button>
+          <button id="delete-profile" class="danger-button hidden" type="button">حذف الملف</button>
+          <button id="cancel-profile-edit" class="btn-info" type="button">إلغاء</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===== تسجيل الدخول / إنشاء حساب ===== -->
+  <div id="auth-modal" class="modal auth-modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-auth-close></div>
+    <div class="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+      <button class="modal-close" type="button" data-auth-close aria-label="إغلاق">✕</button>
+      <div class="auth-brand-mark">▶</div>
+      <h2 id="auth-title">مزامنة ملفاتك</h2>
+      <p class="auth-subtitle">سجّل الدخول لاستعادة تقدمك وقوائمك على أي جهاز.</p>
+
+      <div class="auth-tabs" role="tablist">
+        <button class="auth-tab active" type="button" data-auth-mode="login">تسجيل الدخول</button>
+        <button class="auth-tab" type="button" data-auth-mode="register">حساب جديد</button>
+      </div>
+
+      <form id="auth-form">
+        <div id="register-name-field" class="form-field hidden">
+          <label class="field-label" for="auth-profile-name">اسم الملف الأول</label>
+          <input id="auth-profile-name" class="form-input" maxlength="30" value="الملف الرئيسي" />
+        </div>
+        <div id="register-activation-field" class="form-field hidden">
+          <label class="field-label" for="auth-activation-code">رمز التفعيل</label>
+          <input id="auth-activation-code" class="form-input activation-code-input" autocomplete="one-time-code" />
+          <small>كل رمز صالح للاستخدام مرة واحدة فقط.</small>
+        </div>
+        <div class="form-field">
+          <label class="field-label" for="auth-email">البريد الإلكتروني</label>
+          <input id="auth-email" class="form-input" type="email" autocomplete="email" required />
+        </div>
+        <div class="form-field">
+          <label class="field-label" for="auth-password">كلمة المرور</label>
+          <input id="auth-password" class="form-input" type="password" minlength="10" maxlength="128" autocomplete="current-password" required />
+          <small>10 أحرف على الأقل.</small>
+        </div>
+        <p id="auth-error" class="form-error hidden" role="alert"></p>
+        <button id="auth-submit" class="btn-play auth-submit" type="submit">تسجيل الدخول</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===== لوحة الإدارة (تُبنى بالكامل عبر admin-ui.js) ===== -->
+  <div id="admin-modal" class="ash-root" aria-hidden="true"></div>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- ===== طبقة المشغل ===== -->
+  <div id="player-overlay" class="player-overlay hidden">
+    <div class="player-topbar">
+      <button id="player-back" class="player-back">← رجوع</button>
+      <span id="player-title" class="player-title"></span>
+    </div>
+    <div class="player-stage">
+      <div class="player-frame">
+        <video
+          id="main-player"
+          class="video-js vjs-big-play-centered"
+          controls
+          playsinline
+          crossorigin="anonymous"
+          preload="metadata"
+        ></video>
+
+        <div class="player-feedback">
+          <div id="fb-seek-back" class="fb fb-seek">↺<span>10-</span></div>
+          <div id="fb-seek-fwd" class="fb fb-seek">↻<span>10+</span></div>
+          <div id="fb-volume" class="fb fb-volume"></div>
+          <div id="fb-play" class="fb fb-play"></div>
+        </div>
+
+        <div id="player-error" class="player-error hidden">
+          <div class="player-error-card">
+            <div class="player-error-icon">⚠</div>
+            <p id="player-error-msg">عذراً، المحتوى غير متوفر حالياً، يرجى المحاولة لاحقاً.</p>
+            <div class="player-error-actions">
+              <button id="player-error-retry" class="btn-play">إعادة المحاولة</button>
+              <button id="player-error-close" class="btn-info">إغلاق</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============== المكتبات الخارجية (Video.js) ============== -->
+  <script src="https://cdn.jsdelivr.net/npm/video.js@7.21.6/dist/video.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/videojs-contrib-quality-levels@2.2.1/dist/videojs-contrib-quality-levels.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/videojs-hls-quality-selector@1.1.4/dist/videojs-hls-quality-selector.min.js"></script>
+
+  <!-- ============== كود التطبيق (الترتيب مهم!) ==============
+       1. CONFIG / AUTH / PROFILES / SYNC
+       2. STORAGE  - بيانات الملف المعزولة
+       3. API / SUBTITLES / SOURCES
+       4. UI / PROFILE_UI
+       5. PLAYER / APP
+  -->
+  <script src="js/config.js?v=20260811-admin4"></script>
+  <script src="js/auth.js?v=20260811-admin4"></script>
+  <script src="js/profiles.js?v=20260811-admin4"></script>
+  <script src="js/profile-sync.js?v=20260811-admin4"></script>
+  <script src="js/storage.js?v=20260811-admin4"></script>
+  <script src="js/api.js?v=20260811-admin4"></script>
+  <script src="js/subtitles.js?v=20260811-admin4"></script>
+  <script src="js/sources.js?v=20260811-admin4"></script>
+  <script src="js/ui.js?v=20260811-admin4"></script>
+  <script src="js/profile-ui.js?v=20260811-admin4"></script>
+  <script src="js/admin-ui.js?v=20260811-admin4"></script>
+  <script src="js/access-gate.js?v=20260811-admin4"></script>
+  <script src="js/player.js?v=20260811-admin4"></script>
+  <script src="js/app.js?v=20260811-admin4"></script>
+
+  <!-- إخفاء شاشة التحميل بعد كل شيء -->
+  <script>
+    window.addEventListener("load", () => {
+      const boot = document.getElementById("boot-screen");
+      if (boot) {
+        boot.classList.add("hidden");
+        setTimeout(() => boot.remove(), 500);
+      }
+    });
+  </script>
+
+    <!-- ===== طبقة مشغل التضمين — تبديل تلقائي + اختيار يدوي ===== -->
+    <div id="embed-overlay" class="embed-overlay hidden">
+      <div class="embed-topbar">
+        <button id="embed-back" class="embed-back">← رجوع</button>
+        <h3 id="embed-title" class="embed-title"></h3>
+        <div class="embed-server-controls">
+          <label class="embed-server-label" for="embed-server">المشغل</label>
+          <select id="embed-server" class="embed-server" aria-label="اختيار المشغل"></select>
+          <button id="embed-next-server" class="embed-control-button" type="button">
+            المشغل التالي
+          </button>
+          <button id="embed-sidebar-toggle" class="embed-control-button hidden" type="button" aria-expanded="true">
+            الحلقات
+          </button>
+        </div>
+      </div>
+  
+      <div class="embed-stage">
+        <div id="embed-workspace" class="embed-workspace">
+          <aside id="embed-episodes-panel" class="embed-episodes-panel hidden" aria-label="المواسم والحلقات">
+            <div class="embed-panel-head">
+              <div>
+                <span>تنقل سريع</span>
+                <h4>الحلقات</h4>
+              </div>
+              <button id="embed-panel-close" type="button" aria-label="إخفاء الحلقات">✕</button>
+            </div>
+            <label class="embed-season-label" for="embed-season">الموسم</label>
+            <select id="embed-season" class="embed-season"></select>
+            <div id="embed-episodes-list" class="embed-episodes-list"></div>
+          </aside>
+
+          <div class="embed-frame">
+            <iframe
+              id="embed-iframe"
+              title="مشغل الفيديو"
+              allowfullscreen
+              allow="autoplay; encrypted-media; picture-in-picture; fullscreen"
+              referrerpolicy="origin"
+            ></iframe>
+
+            <div id="embed-loading" class="embed-loading hidden">
+              <div class="embed-loading-spinner"></div>
+              <p id="embed-loading-text" class="embed-loading-text">جاري تحميل المشغل...</p>
+              <p id="embed-loading-server" class="embed-loading-server"></p>
+            </div>
+
+            <div id="embed-verification" class="embed-verification hidden">
+              <span id="embed-verification-text">سيتم تجربة مشغل آخر تلقائياً إذا لم يبدأ هذا المشغل.</span>
+              <div>
+                <button id="embed-confirm-working" type="button">المشغل يعمل</button>
+                <button id="embed-skip-loading" type="button">جرّب التالي الآن</button>
+              </div>
+            </div>
+
+            <div id="embed-error" class="embed-error hidden">
+              <div class="embed-error-card">
+                <div class="embed-error-icon">⚠</div>
+                <p class="embed-error-msg">كل المشغلات غير متاحة.</p>
+                <div class="embed-error-actions">
+                  <button class="embed-error-next">المشغل التالي</button>
+                  <button class="embed-error-retry">إعادة المحاولة</button>
+                  <button class="embed-error-close">إغلاق</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  
+    <script src="js/embed.v2.js?v=20260811-admin4"></script>
+    <script src="js/embed-player.v2.js?v=20260811-admin4"></script>
+  
+
+</body>
+</html>
