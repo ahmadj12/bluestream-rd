@@ -1701,7 +1701,22 @@ async function getPlayableFromInspected(
   return null;
 }
 
+async function rdGetPlayableUrl(link) {
+  if (!link) {
+    return null;
+  }
 
+  const inspected =
+    await inspectRDLink(link);
+
+  if (!inspected) {
+    return null;
+  }
+
+  return await getPlayableFromInspected(
+    inspected
+  );
+}
 // ============================================================
 // FIND BEST PLAYABLE FILE
 // ============================================================
