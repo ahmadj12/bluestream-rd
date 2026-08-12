@@ -1,11 +1,5 @@
 // server.js — Real-Debrid + OpenSubtitles (Arabic) + MySQL cache
-// Endpoints:
-//   GET  /api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1&with_subs=1
-//   GET  /api/subtitles?tmdb_id=...&type=...&season=1&episode=1&title=...&year=...
-//   GET  /api/cache/stats
-//   POST /api/cache/clean
-//   DELETE /api/cache/:tmdb_id/:type
-//   GET  /  (status)
+// الإصدار 7.1: يبحث بطرق متعددة (مع وبدون S01E01) + يدعم الأفلام بدون year
 
 const express = require("express");
 const https = require("https");
@@ -181,7 +175,7 @@ async function searchYTS(query, year) {
           name: `${movie.title} ${movie.year} ${t.quality} ${t.type}`,
           title: `${movie.title} (${movie.year}) [${t.quality}]`,
           url_path: null,
-          magnet: `magnet:?xt=urn:btih:${t.hash}&dn=${encodeURIComponent(movie.title + ' ' + t.quality)}&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.openbittorrent.com:80&tr=udp://tracker.coppersurfer.tk:6969&tr=udp://glotorrents.pw:6969/announce&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://torrent.gresille.org:80/announce&tr=udp://p4p.arenabg.com:1337&tr=udp://tracker.internetwarriors.net:1337`,
+          magnet: `magnet:?xt=urn:btih:${t.hash}&dn=${encodeURIComponent(movie.title + ' ' + t.quality)}&tr=udp://open.demonii.com:1337/announce&tr=udp://tracker.openbittorrent.com:80&tr=udp://tracker.coppersurfer.tk:6969&tr=udp://glotorrants.pw:6969/announce&tr=udp://tracker.opentrackr.org:1337/announce&tr=udp://torrent.gresille.org:80/announce&tr=udp://p4p.arenabg.com:1337&tr=udp://tracker.internetwarriors.net:1337`,
           quality: t.quality, size: parseInt(t.size_bytes || 0), size_str: t.size || '',
           seeds: parseInt(t.seeds || 0), source: 'yts',
         });
@@ -260,6 +254,42 @@ async function searchAllSources(query, type, year) {
     }));
   }
   return results.filter(t => t.magnet);
+}
+
+// 🔑 دالة محسّنة: تبحث بطرق متعددة (مع/بدون S01E01، مع/بدون year)
+async function searchTorrentsMulti(displayTitle, type, sNum, eNum, year) {
+  const queries = [];
+
+  if (type === 'movie') {
+    // أفلام: نجرّب عدة تركيبات
+    queries.push(year ? `${displayTitle} ${year}` : displayTitle);
+    queries.push(displayTitle);
+    if (year) queries.push(`${displayTitle} ${parseInt(year) - 1} ${parseInt(year) + 1}`);
+  } else {
+    // مسلسلات: نجرّب مع وبدون S01E01
+    const epTag = `S${String(sNum || 1).padStart(2, '0')}E${String(eNum || 1).padStart(2, '0')}`;
+    queries.push(`${displayTitle} ${epTag}`);
+    queries.push(`${displayTitle} S${sNum || 1}E${eNum || 1}`); // بدون padding
+    queries.push(`${displayTitle} ${epTag} ${year || ""}`.trim());
+    queries.push(displayTitle); // بدون S/E أبداً
+  }
+
+  let allTorrents = [];
+  const seen = new Set();
+  for (const q of queries) {
+    if (!q || q.trim().length < 2) continue;
+    console.log(`   🔍 جرّب: "${q}"`);
+    const r = await searchAllSources(q, type, year);
+    for (const t of r) {
+      const key = t.magnet || t.url_path;
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        allTorrents.push(t);
+      }
+    }
+    if (allTorrents.length >= 5) break; // عندنا كفاية
+  }
+  return allTorrents;
 }
 
 function getQualityScore(title) {
@@ -410,12 +440,11 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
 }
 
 // =============================================================
-// CORE: try to get a stream URL for given media
-// returns { stream_url, subtitle, ...meta } or null
+// CORE
 // =============================================================
 
 async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
-  // 1) Check cache
+  // 1) Cache
   const cached = await cache.getCache(id, type, sNum, eNum);
 
   if (cached.hit && cached.fresh) {
@@ -439,11 +468,12 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
       size_mb: Math.round((cached.data.file_size_bytes || 0) / 1024 / 1024),
       seeds: cached.data.seeds || 0,
       poster: cached.data.poster_path ? `https://image.tmdb.org/t/p/w500${cached.data.poster_path}` : null,
+      backdrop: cached.data.backdrop_path ? `https://image.tmdb.org/t/p/w1280${cached.data.backdrop_path}` : null,
       cached: true,
     };
   }
 
-  // 2) Cached but expired → try to re-unrestrict
+  // 2) Re-unrestrict
   if (cached.hit && !cached.fresh && cached.data?.magnet) {
     try {
       let unrestricted = cached.data.rd_link ? await rdUnrestrict(cached.data.rd_link) : null;
@@ -464,6 +494,7 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
           magnet: cached.data.magnet, source: cached.data.source, status: 'ready',
           file_size_bytes: cached.data.file_size_bytes, quality: cached.data.quality,
           filename: cached.data.filename, seeds: cached.data.seeds,
+          poster_path: cached.data.poster_path, backdrop_path: cached.data.backdrop_path,
         });
         const subtitle = withSubs ? await searchOpenSubtitles({
           tmdbId: parseInt(id), type, season: sNum, episode: eNum,
@@ -476,6 +507,8 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
           title: cached.data.title,
           stream_url: unrestricted.download,
           subtitle, subtitles: subtitle ? [subtitle.url] : [],
+          poster: cached.data.poster_path ? `https://image.tmdb.org/t/p/w500${cached.data.poster_path}` : null,
+          backdrop: cached.data.backdrop_path ? `https://image.tmdb.org/t/p/w1280${cached.data.backdrop_path}` : null,
           cached: true, refreshed: true,
         };
       }
@@ -489,18 +522,18 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
   const displayTitle = meta.title || meta.name || meta.original_title || meta.original_name;
   const year = (meta.release_date || meta.first_air_date || '').slice(0, 4);
   const poster = meta.poster_path ? `https://image.tmdb.org/t/p/w500${meta.poster_path}` : null;
+  const backdrop = meta.backdrop_path ? `https://image.tmdb.org/t/p/w1280${meta.backdrop_path}` : null;
 
-  console.log(`\n🎬 ${displayTitle} (${year}) | ${type} S${sNum || 1}E${eNum || 1}`);
+  console.log(`\n🎬 ${displayTitle} (${year || "?"}) | ${type} S${sNum || 1}E${eNum || 1}`);
 
-  // ⚠️ ما نسوي markPending بعد الآن — نشتغل مباشرة
-  const searchQuery = type === 'movie'
-    ? (year ? `${displayTitle} ${year}` : displayTitle)
-    : `${displayTitle} S${String(sNum || 1).padStart(2, '0')}E${String(eNum || 1).padStart(2, '0')}`;
+  // 🔑 البحث الذكي بطرق متعددة
+  const torrents = await searchTorrentsMulti(displayTitle, type, sNum, eNum, year);
 
-  const torrents = await searchAllSources(searchQuery, type, year);
   if (torrents.length === 0) {
-    return { success: false, error: `لم يتم العثور على "${displayTitle}"` };
+    return { success: false, error: `لم يتم العثور على "${displayTitle}" — جرب حلقة أو موسم ثاني` };
   }
+
+  console.log(`📊 إجمالي النتائج: ${torrents.length} torrent`);
 
   torrents.sort((a, b) => (getQualityScore(b.name) + (b.seeds||0)*0.1) - (getQualityScore(a.name) + (a.seeds||0)*0.1));
   const maxAttempts = Math.min(5, torrents.length);
@@ -560,7 +593,7 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
       subtitles: subtitle ? [subtitle.url] : [],
       size_mb: Math.round((bestSize || torrent.size || 0) / 1024 / 1024),
       seeds: torrent.seeds || 0,
-      poster, cached: false,
+      poster, backdrop, cached: false,
     };
   }
 
@@ -568,10 +601,9 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 }
 
 // =============================================================
-// MAIN ENDPOINTS
+// ENDPOINTS
 // =============================================================
 
-// ترجمة فقط
 app.get("/api/subtitles", async (req, res) => {
   const { tmdb_id, type, season, episode, title, year } = req.query;
   if (!tmdb_id && !title) {
@@ -589,12 +621,10 @@ app.get("/api/subtitles", async (req, res) => {
   }
 });
 
-// المشغل الأساسي
 app.get("/api/play", async (req, res) => {
   const { id, type, season, episode, with_subs = '1' } = req.query;
   if (!id || !type) return res.status(400).json({ success: false, error: "Missing id or type" });
 
-  // مهلة طويلة — RD أحياناً يحتاج 90+ ثانية
   req.setTimeout(300000);
   res.setTimeout(300000);
 
@@ -641,22 +671,18 @@ app.delete("/api/cache/:tmdb_id/:type", async (req, res) => {
 
 app.get("/", (req, res) => {
   res.json({
-    status: "✅ Real-Debrid + Arabic Subtitles API",
-    version: "7.0",
+    status: "✅ Real-Debrid + Arabic Subtitles API v7.1",
+    version: "7.1",
+    features: ["multi-query search", "smart TV matching", "arabic subtitles"],
     endpoints: {
       play: "/api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1&with_subs=1",
       subtitles: "/api/subtitles?tmdb_id=...&type=movie&title=...",
-      cache_stats: "GET /api/cache/stats",
-      cache_clean: "POST /api/cache/clean",
     },
-    sources: ['torrentdownloads.pro', 'yts.mx', '1337x.to'],
-    subtitles: 'OpenSubtitles v1 (Arabic)',
-    cache: { type: 'MySQL', table: 'media_cache', ttl_hours: 23 },
   });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n🎬 BlueStream API v7.0 running on port ${PORT}`);
+  console.log(`\n🎬 BlueStream API v7.1 running on port ${PORT}`);
   console.log(`✅ RD Token: ${RD_TOKEN ? 'Loaded' : 'MISSING'}`);
   console.log(`✅ TMDB Key: ${TMDB_KEY ? 'Loaded' : 'MISSING'}`);
   console.log(`✅ OpenSubtitles: ${OS_API_KEY ? 'Loaded' : 'MISSING'}`);

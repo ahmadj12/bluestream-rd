@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>BlueStream - مشغل بدون إعلانات</title>
+
+  <link rel="preconnect" href="https://cdn.jsdelivr.net" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.css" />
+
+  <style>
+    :root {
+      --plyr-color-main: #3b82f6;
+      --plyr-video-background: #000;
+      --plyr-menu-background: rgba(9, 9, 11, 0.96);
+      --plyr-captions-background: rgba(0, 0, 0, 0.6);
+      --plyr-captions-text-color: #fff;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0c0c0e;
+      color: #f4f4f5;
+      font-family: "Cairo", system-ui, -apple-system, sans-serif;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .container { max-width: 1400px; margin: 0 auto; }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .back-btn {
+      padding: 10px 20px;
+      background: rgba(9, 9, 11, 0.6);
+      border: 1px solid #2a2a30;
+      border-radius: 8px;
+      color: #f4f4f5;
+      font-family: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.2s;
+    }
+    .back-btn:hover { background: #1c1c22; border-color: #3b82f6; }
+
+    .title {
+      flex: 1;
+      font-size: 1.3rem;
+      font-weight: 800;
+      color: #fff;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .quality-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      background: #3b82f6;
+      color: #fff;
+      font-size: 0.75rem;
+      font-weight: 800;
+      border-radius: 999px;
+      margin-inline-start: 8px;
+      vertical-align: middle;
+    }
+
+    .sub-badge {
+      display: inline-block;
+      padding: 4px 10px;
+      background: rgba(16, 185, 129, 0.2);
+      color: #10b981;
+      font-size: 0.75rem;
+      font-weight: 800;
+      border-radius: 999px;
+      margin-inline-start: 6px;
+      border: 1px solid rgba(16, 185, 129, 0.4);
+      vertical-align: middle;
+    }
+
+    .player-wrapper {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 20px 60px rgba(0, 0, 0, 0.7);
+    }
+    .player-wrapper video { width: 100%; height: 100%; }
+
+    .status {
+      margin-top: 16px;
+      padding: 16px 18px;
+      background: #17171c;
+      border: 1px solid #2a2a30;
+      border-radius: 10px;
+      font-size: 0.95rem;
+      color: #a0a0aa;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .status.success { border-color: #10b981; color: #10b981; }
+    .status.error { border-color: #ef4444; color: #ef4444; }
+    .status.loading { border-color: #3b82f6; color: #3b82f6; }
+
+    .spinner {
+      display: inline-block;
+      width: 18px;
+      height: 18px;
+      border: 2px solid currentColor;
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .plyr--full-ui.plyr--rtl { direction: ltr; }
+    .plyr--full-ui video::cue,
+    .plyr__captions {
+      direction: rtl !important;
+      text-align: center !important;
+      unicode-bidi: plaintext !important;
+      font-family: "Cairo", "Tahoma", sans-serif !important;
+      font-size: 1.4em !important;
+      line-height: 1.4 !important;
+      color: #fff !important;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.9), 0 0 4px rgba(0,0,0,0.7) !important;
+      background: rgba(0, 0, 0, 0.55) !important;
+      padding: 2px 6px !important;
+      border-radius: 4px !important;
+    }
+
+    @media (max-width: 600px) {
+      body { padding: 10px; }
+      .title { font-size: 1rem; }
+      .header { gap: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <a href="index.html" class="back-btn">← رجوع</a>
+      <h1 class="title" id="title">جاري التحميل...</h1>
+    </div>
+
+    <div class="player-wrapper">
+      <video id="player" controls crossorigin playsinline></video>
+    </div>
+
+    <div class="status loading" id="status">
+      <span class="spinner"></span>
+      <span>جاري جلب الرابط من Real-Debrid...</span>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/plyr@3.7.8/dist/plyr.polyfilled.js"></script>
+
+  <script>
+    // ===== Config: دومين الـ API (عدّله لو غيّرت دومين Railway) =====
+    const API_BASE =
+      (window.CONFIG?.RD_API_BASE && String(window.CONFIG.RD_API_BASE).replace(/\/$/, "")) ||
+      "https://bluestream-rd-production.up.railway.app";
+
+    const params = new URLSearchParams(window.location.search);
+    const tmdbId = params.get("id");
+    const type = params.get("type") || "movie";
+    const season = params.get("season") || 1;
+    const episode = params.get("episode") || 1;
+    const titleParam = params.get("title") || "BlueStream";
+
+    document.getElementById("title").textContent = decodeURIComponent(titleParam);
+
+    const video = document.getElementById("player");
+    let hls = null;
+    let player = null;
+
+    if (typeof Plyr !== "undefined") {
+      player = new Plyr(video, {
+        controls: [
+          "play-large", "play", "restart", "rewind", "fast-forward",
+          "progress", "current-time", "duration", "mute", "volume",
+          "captions", "settings", "pip", "fullscreen", "airplay",
+        ],
+        settings: ["captions", "quality", "speed"],
+        speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+        seekTime: 10,
+        captions: { active: true, language: "ar", update: true },
+        i18n: {
+          restart: "إعادة",
+          rewind: "رجوع 10 ثواني",
+          play: "تشغيل",
+          pause: "إيقاف",
+          fastForward: "تقدم 10 ثواني",
+          seek: "بحث",
+          played: "مشغّل",
+          buffered: "محمل",
+          currentTime: "الوقت الحالي",
+          duration: "المدة",
+          volume: "الصوت",
+          mute: "كتم",
+          unmute: "إلغاء الكتم",
+          enableCaptions: "تفعيل الترجمة",
+          disableCaptions: "إيقاف الترجمة",
+          download: "تحميل",
+          enterFullscreen: "شاشة كاملة",
+          exitFullscreen: "خروج من شاشة كاملة",
+          settings: "الإعدادات",
+          pip: "صورة داخل صورة",
+          menuBack: "رجوع",
+          speed: "السرعة",
+          normal: "عادي",
+          quality: "الجودة",
+          loop: "تكرار",
+          start: "بداية",
+          end: "نهاية",
+          all: "الكل",
+          reset: "إعادة ضبط",
+        },
+      });
+    }
+
+    function setStatus(html, type = "") {
+      const el = document.getElementById("status");
+      el.className = `status ${type}`;
+      el.innerHTML = html;
+    }
+
+    function attachSubtitle(subtitle) {
+      if (!subtitle?.url) return;
+      [...video.querySelectorAll("track")].forEach((t) => t.remove());
+      const track = document.createElement("track");
+      track.kind = "captions";
+      track.label = subtitle.label || "العربية";
+      track.srclang = subtitle.language || "ar";
+      track.src = subtitle.url;
+      track.default = true;
+      video.appendChild(track);
+    }
+
+    function playStream(streamUrl, subtitle) {
+      if (hls) { try { hls.destroy(); } catch {} hls = null; }
+
+      if (streamUrl.includes(".m3u8")) {
+        if (window.Hls && Hls.isSupported()) {
+          hls = new Hls({ enableWorker: true });
+          hls.loadSource(streamUrl);
+          hls.attachMedia(video);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => {
+            video.play().catch(() => {});
+          });
+          hls.on(Hls.Events.ERROR, (e, data) => {
+            if (data?.fatal) {
+              setStatus("❌ تعذّر تشغيل الفيديو.", "error");
+            }
+          });
+        } else {
+          video.src = streamUrl;
+          video.addEventListener("loadedmetadata", () => video.play().catch(() => {}), { once: true });
+        }
+      } else {
+        video.src = streamUrl;
+        video.addEventListener("loadedmetadata", () => video.play().catch(() => {}), { once: true });
+      }
+
+      attachSubtitle(subtitle);
+    }
+
+    // Polling ذكي: لو الـ API رجّع pending نعيد المحاولة تلقائياً
+    async function fetchWithRetry(maxAttempts = 30, intervalMs = 3000) {
+      const apiUrl =
+        `${API_BASE}/api/play?` +
+        `id=${encodeURIComponent(tmdbId)}` +
+        `&type=${encodeURIComponent(type)}` +
+        `&season=${encodeURIComponent(season)}` +
+        `&episode=${encodeURIComponent(episode)}` +
+        `&with_subs=1`;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          if (attempt === 0) {
+            setStatus('<span class="spinner"></span> جاري البحث في TorrentDownloads...', "loading");
+          } else if (attempt < 3) {
+            setStatus(`<span class="spinner"></span> جاري جلب رابط Real-Debrid... (${attempt * 3}ث)`, "loading");
+          } else {
+            setStatus(`<span class="spinner"></span> جاري التحضير... (${attempt * 3}ث) — يتم تجهيز أعلى جودة متاحة`, "loading");
+          }
+
+          const res = await fetch(apiUrl, { headers: { "Accept": "application/json" } });
+          const data = await res.json();
+
+          if (data?.success && data.stream_url) {
+            const subText = data.subtitle ? ' <span class="sub-badge">🇸🇦 ترجمة</span>' : '';
+            document.getElementById("title").innerHTML =
+              `${decodeURIComponent(titleParam)} <span class="quality-badge">${data.quality || ""}</span>${subText}`;
+            setStatus(
+              `✅ يعمل بدون إعلانات · ${data.quality || "?"} · ${data.provider || "real-debrid"}`,
+              "success"
+            );
+            playStream(data.stream_url, data.subtitle);
+            return;
+          }
+
+          if (data?.status === "pending" || res.status === 202) {
+            await new Promise(r => setTimeout(r, intervalMs));
+            continue;
+          }
+
+          if (!data?.success) {
+            setStatus(`❌ ${data?.error || "فشل جلب الرابط"}`, "error");
+            return;
+          }
+        } catch (err) {
+          if (attempt === maxAttempts - 1) {
+            setStatus(`❌ تعذّر الاتصال بالخادم: ${err.message}`, "error");
+            return;
+          }
+          await new Promise(r => setTimeout(r, intervalMs));
+        }
+      }
+      setStatus("⏱ انتهت مهلة الانتظار. حاول مرة ثانية.", "error");
+    }
+
+    if (tmdbId) {
+      fetchWithRetry();
+    } else {
+      setStatus("⚠️ لا يوجد معرف. جرب: <code>player.html?id=603&type=movie&title=Matrix</code>", "error");
+    }
+  </script>
+</body>
+</html>
