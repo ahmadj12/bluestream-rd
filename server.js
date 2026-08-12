@@ -7,6 +7,8 @@ const cache = require("./cache");
 // Initialize MySQL connection pool on startup
 try {
   cache.initPool();
+  // Auto-create tables on first run
+  cache.runMigrations().catch(err => console.warn('⚠️ Auto-migration skipped:', err.message));
 } catch (err) {
   console.warn('⚠️ MySQL init failed (cache will be disabled):', err.message);
 }
