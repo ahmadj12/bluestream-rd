@@ -956,26 +956,58 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
   torrents.sort((a, b) => getQualityScore(b) - getQualityScore(a));
 
-  const maxAttempts = Math.min(8, torrents.length);
+  // 🔑 نزيد عدد المحاولات لأن Torrentio يعطي نتائج كثيرة تالفة
+
+  const maxAttempts = Math.min(30, torrents.length);
 
 
   for (let i = 0; i < maxAttempts; i++) {
 
     const torrent = torrents[i];
 
-    console.log(`\n🔄 [${i + 1}/${maxAttempts}] ${torrent.quality} | ${(torrent.name || '').substring(0, 60)}`);
+
+    // 🔑 Validation: نتأكد من infoHash قبل ما نرسل لـ RD
+
+    if (!torrent.infoHash || torrent.infoHash.length !== 40 || !/^[a-f0-9]{40}$/i.test(torrent.infoHash)) {
+
+      console.log(`\n🔄 [${i + 1}/${maxAttempts}] ${torrent.quality} | ${(torrent.name || '').substring(0, 50)}`);
+
+      console.log(`   ⚠ Invalid infoHash, skipping`);
+
+      continue;
+
+    }
 
 
-    const added = await rdAddMagnet(torrent.magnet);
+    console.log(`\n🔄 [${i + 1}/${maxAttempts}] ${torrent.quality} | ${(torrent.name || '').substring(0, 50)}`);
 
-    if (!added?.id) { console.log(`   ❌ Failed to add`); continue; }
+
+    let added;
+
+    let retryCount = 0;
+
+    while (retryCount < 3) {
+
+      added = await rdAddMagnet(torrent.magnet);
+
+      if (added?.id) break;
+
+      console.log(`   ⚠ Add failed (attempt ${retryCount + 1}/3), retrying...`);
+
+      retryCount++;
+
+      await new Promise(r => setTimeout(r, 1000));
+
+    }
+
+    if (!added?.id) { console.log(`   ❌ Failed to add after 3 attempts`); continue; }
 
     console.log(`   ✓ Added to RD: ${added.id}`);
 
 
     await rdSelectFiles(added.id, 'all');
 
-    const torrentInfo = await rdWaitForTorrent(added.id);
+    const torrentInfo = await rdWaitForTorrent(added.id, 300000);
 
     if (!torrentInfo) { console.log(`   ❌ Download timeout/error`); continue; }
 
