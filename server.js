@@ -70,21 +70,39 @@ async function getTMDBMeta(id, type) {
   return { meta: res.data };
 }
 
-// 2. جلب Magnet من Torrentio بدون هيدرات RD
+// 2. جلب Magnet من Torrentio مع تخطي الحماية ومحرك احتياطي
 async function fetchTorrentio(type, imdbId, season, episode) {
   const queryPath = type === 'movie' ? `movie/${imdbId}` : `series/${imdbId}:${season}:${episode}`;
-  const url = `https://torrentio.strem.fun/stream/${queryPath}.json`;
-  const res = await request(url);
+  
+  // إضافة هيدرات متصفح حقيقي لتخطي حظر Cloudflare
+  const options = {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Connection': 'keep-alive'
+    }
+  };
 
-  if (res.status !== 200) return { error: `Torrentio returned status ${res.status}` };
+  // المحاولة الأولى: Torrentio الأساسي
+  let res = await request(`https://torrentio.strem.fun/stream/${queryPath}.json`, options);
+
+  // المحاولة الثانية: إذا تم حظر السيرفر (403) أو فشل، ننتقل فوراً لمحرك KnightCrawler المفتوح
+  if (res.status === 403 || res.status !== 200) {
+    res = await request(`https://knightcrawler.elfhosted.com/stream/${queryPath}.json`, options);
+  }
+
+  // إذا فشل الاثنان معاً
+  if (res.status !== 200) return { error: `All scrapers blocked or failed. Last status: ${res.status}` };
   if (!res.data?.streams?.length) return { error: "No torrent streams found for this title" };
 
+  // استخراج رابط المغناطيس
   const stream = res.data.streams.find(s => s.infoHash);
   if (!stream) return { error: "Valid infoHash not found in stream" };
 
   return {
     magnet: `magnet:?xt=urn:btih:${stream.infoHash}`,
-    quality: stream.name?.includes('4K') ? '4K' : '1080p'
+    quality: stream.name?.includes('4K') ? '4K' : (stream.name?.includes('1080p') ? '1080p' : 'Unknown')
   };
 }
 
