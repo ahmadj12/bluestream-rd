@@ -1,12 +1,25 @@
 {
-  "name": "bluestream-rd",
-  "version": "5.0.0",
+  "name": "bluestream-rd-api",
+  "version": "6.0.0",
+  "description": "Real-Debrid + multi-source torrent API with MySQL cache",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "migrate": "node migrate.js"
+  },
+  "engines": {
+    "node": ">=18"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.18.2"
-  }
+    "express": "^4.19.2",
+    "mysql2": "^3.11.0"
+  },
+  "keywords": [
+    "real-debrid",
+    "torrent",
+    "streaming",
+    "tmdb",
+    "cache"
+  ],
+  "license": "MIT"
 }

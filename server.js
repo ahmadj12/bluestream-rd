@@ -2,6 +2,14 @@ const express = require("express");
 const https = require("https");
 const http = require("http");
 const { URL } = require("url");
+const cache = require("./cache");
+
+// Initialize MySQL connection pool on startup
+try {
+  cache.initPool();
+} catch (err) {
+  console.warn('⚠️ MySQL init failed (cache will be disabled):', err.message);
+}
 
 const app = express();
 app.use(express.json());
@@ -502,9 +510,9 @@ async function rdUnrestrict(link) {
   }
 }
 
-// ====== Main API endpoint ======
+// ====== Main API endpoint (cache-aware) ======
 app.get("/api/play", async (req, res) => {
-  const { id, type, season, episode } = req.query;
+  const { id, type, season, episode, force_refresh } = req.query;
   if (!id || !type) {
     return res.status(400).json({ success: false, error: "Missing id or type" });
   }
@@ -513,7 +521,123 @@ app.get("/api/play", async (req, res) => {
   req.setTimeout(300000);
   res.setTimeout(300000);
 
+  const sNum = type === 'tv' ? parseInt(season || 1) : null;
+  const eNum = type === 'tv' ? parseInt(episode || 1) : null;
+
   try {
+    // ====== STEP 1: Check cache ======
+    if (force_refresh !== '1' && force_refresh !== 'true') {
+      const cached = await cache.getCache(id, type, sNum, eNum);
+
+      if (cached.hit && cached.fresh) {
+        // 🎯 Cache hit — instant response
+        console.log(`\n⚡ CACHE HIT: ${cached.data.title} (${cached.data.quality})`);
+        return res.json({
+          success: true,
+          provider: `real-debrid+${cached.data.source || 'cache'}`,
+          quality: cached.data.quality,
+          title: cached.data.title,
+          year: cached.data.year,
+          filename: cached.data.filename,
+          stream_url: cached.data.stream_url,
+          subtitles: [],
+          size_mb: Math.round((cached.data.file_size_bytes || 0) / 1024 / 1024),
+          seeds: cached.data.seeds || 0,
+          poster: cached.data.poster_path ? `https://image.tmdb.org/t/p/w500${cached.data.poster_path}` : null,
+          cached: true,
+          cache_id: cached.data.id,
+          cached_at: cached.data.fetched_at,
+        });
+      }
+
+      if (cached.hit && !cached.fresh && cached.data?.magnet && cached.data.magnet) {
+        // Cached but stream_url expired — try to re-unrestrict with existing magnet
+        console.log(`\n🔄 Cache expired, re-unrestricting from stored magnet: ${cached.data.title}`);
+        try {
+          const rdLink = cached.data.rd_link;
+          let unrestricted;
+
+          if (rdLink) {
+            // Try the stored link first
+            unrestricted = await rdUnrestrict(rdLink);
+          }
+
+          if (!unrestricted) {
+            // Re-add the magnet and pick files
+            const added = await rdAddMagnet(cached.data.magnet);
+            if (added && added.id) {
+              await rdSelectFiles(added.id, 'all');
+              const info = await rdWaitForTorrent(added.id, 180000);
+              if (info && info.links && info.links.length > 0) {
+                unrestricted = await rdUnrestrict(info.links[0]);
+              }
+            }
+          }
+
+          if (unrestricted && unrestricted.download) {
+            // Update cache with new stream_url
+            await cache.setCache({
+              tmdb_id: parseInt(id),
+              media_type: type,
+              season: sNum,
+              episode: eNum,
+              title: cached.data.title,
+              original_title: cached.data.original_title,
+              year: cached.data.year,
+              poster_path: cached.data.poster_path,
+              backdrop_path: cached.data.backdrop_path,
+              overview: cached.data.overview,
+              runtime: cached.data.runtime,
+              vote_average: cached.data.vote_average,
+              genres: cached.data.genres,
+              rd_torrent_id: cached.data.rd_torrent_id,
+              rd_link: cached.data.rd_link,
+              stream_url: unrestricted.download,
+              filename: cached.data.filename,
+              file_size_bytes: cached.data.file_size_bytes,
+              quality: cached.data.quality,
+              video_format: cached.data.video_format,
+              video_codec: cached.data.video_codec,
+              audio_codec: cached.data.audio_codec,
+              source: cached.data.source,
+              magnet: cached.data.magnet,
+              seeds: cached.data.seeds,
+              status: 'ready',
+            });
+
+            console.log(`   ✅ Re-unrestricted from cache magnet`);
+            return res.json({
+              success: true,
+              provider: `real-debrid+${cached.data.source || 'cache'}`,
+              quality: cached.data.quality,
+              title: cached.data.title,
+              year: cached.data.year,
+              filename: cached.data.filename,
+              stream_url: unrestricted.download,
+              subtitles: [],
+              size_mb: Math.round((cached.data.file_size_bytes || 0) / 1024 / 1024),
+              seeds: cached.data.seeds || 0,
+              poster: cached.data.poster_path ? `https://image.tmdb.org/t/p/w500${cached.data.poster_path}` : null,
+              cached: true,
+              refreshed: true,
+            });
+          }
+        } catch (err) {
+          console.warn(`   ⚠️ Re-unrestrict failed: ${err.message} — falling through to fresh fetch`);
+        }
+      }
+
+      if (cached.pending) {
+        return res.status(202).json({
+          success: false,
+          status: 'pending',
+          error: 'هذا المحتوى قيد التحضير، حاول بعد لحظات',
+          cache_id: cached.data?.id,
+        });
+      }
+    }
+
+    // ====== STEP 2: Fresh fetch (no cache or expired) ======
     // 1) TMDB metadata
     const meta = await getTMDBMeta(id, type);
     if (!meta) return res.status(404).json({ success: false, error: "TMDB not found" });
@@ -522,20 +646,24 @@ app.get("/api/play", async (req, res) => {
     const year = (meta.release_date || meta.first_air_date || '').slice(0, 4);
     const poster = meta.poster_path ? `https://image.tmdb.org/t/p/w500${meta.poster_path}` : null;
 
-    console.log(`\n🎬 ${displayTitle} (${year}) | ${type} S${season || 1}E${episode || 1}`);
+    console.log(`\n🎬 ${displayTitle} (${year}) | ${type} S${sNum || 1}E${eNum || 1}`);
+
+    // Mark as pending so concurrent requests don't all fetch
+    await cache.markPending(id, type, sNum, eNum);
 
     // 2) Build search query
     let searchQuery;
     if (type === 'movie') {
       searchQuery = year ? `${displayTitle} ${year}` : displayTitle;
     } else {
-      searchQuery = `${displayTitle} S${String(season || 1).padStart(2, '0')}E${String(episode || 1).padStart(2, '0')}`;
+      searchQuery = `${displayTitle} S${String(sNum || 1).padStart(2, '0')}E${String(eNum || 1).padStart(2, '0')}`;
     }
 
     // 3) Search across sources
     const torrents = await searchAllSources(searchQuery, type, year);
 
     if (torrents.length === 0) {
+      await cache.markFailed(id, type, sNum, eNum, 'No torrents found in any source');
       return res.status(404).json({
         success: false,
         error: `لم يتم العثور على "${displayTitle}"`,
@@ -587,8 +715,8 @@ app.get("/api/play", async (req, res) => {
 
       // Pick the largest video file (most bytes = best quality)
       let bestLink = links[0];
+      let bestSize = 0;
       if (torrentInfo.files && Array.isArray(torrentInfo.files) && links.length > 1) {
-        let bestSize = 0;
         for (let j = 0; j < Math.min(links.length, torrentInfo.files.length); j++) {
           const fileSize = torrentInfo.files[j]?.bytes || 0;
           if (fileSize > bestSize) {
@@ -606,6 +734,34 @@ app.get("/api/play", async (req, res) => {
 
       console.log(`   ✅ Got stream URL!`);
 
+      // ====== Save to cache ======
+      await cache.setCache({
+        tmdb_id: parseInt(id),
+        media_type: type,
+        season: sNum,
+        episode: eNum,
+        title: displayTitle,
+        original_title: meta.original_title || meta.original_name,
+        year: year,
+        overview: meta.overview,
+        poster_path: meta.poster_path,
+        backdrop_path: meta.backdrop_path,
+        runtime: meta.runtime || (meta.episode_run_time && meta.episode_run_time[0]) || null,
+        vote_average: meta.vote_average,
+        genres: meta.genres ? meta.genres.map(g => g.name).join(', ') : null,
+        rd_torrent_id: added.id,
+        rd_link: bestLink,
+        stream_url: unrestricted.download,
+        filename: torrentInfo.filename,
+        file_size_bytes: bestSize || torrent.size || 0,
+        quality: torrent.quality,
+        audio_codec: torrentInfo.audioCodec || null,
+        source: torrent.source,
+        magnet: torrent.magnet,
+        seeds: torrent.seeds || 0,
+        status: 'ready',
+      });
+
       return res.json({
         success: true,
         provider: `real-debrid+${torrent.source}`,
@@ -615,12 +771,14 @@ app.get("/api/play", async (req, res) => {
         filename: torrentInfo.filename,
         stream_url: unrestricted.download,
         subtitles: [],
-        size_mb: Math.round((torrentInfo.filesize || torrent.size || 0) / 1024 / 1024),
+        size_mb: Math.round((bestSize || torrent.size || 0) / 1024 / 1024),
         seeds: torrent.seeds || 0,
         poster,
+        cached: false,
       });
     }
 
+    await cache.markFailed(id, type, sNum, eNum, 'All torrent attempts failed');
     return res.status(500).json({
       success: false,
       error: `فشل تحميل أي من ${torrents.length} torrents`,
@@ -633,14 +791,57 @@ app.get("/api/play", async (req, res) => {
   }
 });
 
+// ====== Cache admin endpoints ======
+app.get("/api/cache/stats", async (req, res) => {
+  try {
+    const stats = await cache.getStats();
+    res.json({ success: true, stats });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/cache/clean", async (req, res) => {
+  try {
+    const count = await cache.cleanExpired();
+    res.json({ success: true, expired_marked: count });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete("/api/cache/:tmdb_id/:type", async (req, res) => {
+  try {
+    const { tmdb_id, type } = req.params;
+    const { season, episode } = req.query;
+    const p = cache.initPool();
+    const [result] = await p.execute(
+      `DELETE FROM media_cache WHERE tmdb_id = ? AND media_type = ? AND season <=> ? AND episode <=> ?`,
+      [parseInt(tmdb_id), type, season || null, episode || null]
+    );
+    res.json({ success: true, deleted: result.affectedRows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 app.get("/", (req, res) => {
   res.json({
-    status: "✅ Real-Debrid Multi-Source API",
-    version: "5.0",
+    status: "✅ Real-Debrid Multi-Source API + MySQL Cache",
+    version: "6.0",
     endpoints: {
       play: "/api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1",
+      play_force: "/api/play?id={...}&type={...}&force_refresh=1",
+      cache_stats: "GET /api/cache/stats",
+      cache_clean: "POST /api/cache/clean",
+      cache_delete: "DELETE /api/cache/:tmdb_id/:type?season=1&episode=1",
     },
     sources: ['torrentdownloads.pro (direct)', 'yts.mx (movies)', '1337x.to (TV)'],
+    cache: {
+      type: 'MySQL/HeidiSQL',
+      table: 'media_cache',
+      ttl_hours: 23,
+    },
   });
 });
 
