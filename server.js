@@ -73,20 +73,42 @@ async function getTMDBMeta(id, type) {
   }
 }
 
-// ====== جلب Magnet خارجي سريع جداً (Torrentio) ======
-async function fetchExternalMagnet(type, id, season, episode) {
+// ====== جلب Magnet خارجي (Torrentio + Backup Scrap Search) ======
+async function fetchExternalMagnet(type, id, season, episode, meta) {
   try {
+    // 1. المحاولة الأولى: عبر TMDB ID المباشر
     const queryPath = type === 'movie' ? `movie/${id}` : `series/${id}:${season}:${episode}`;
     const response = await fetchURL(`https://torrentio.strem.fun/stream/${queryPath}.json`);
-    if (response.status !== 200 || !response.data?.streams?.length) return null;
+    
+    if (response.status === 200 && response.data?.streams?.length > 0) {
+      const stream = response.data.streams.find(s => s.infoHash);
+      if (stream) {
+        return {
+          magnet: `magnet:?xt=urn:btih:${stream.infoHash}`,
+          quality: stream.name?.includes('4K') ? '4K' : '1080p'
+        };
+      }
+    }
 
-    const stream = response.data.streams.find(s => s.infoHash);
-    if (!stream) return null;
+    // 2. المحاولة الثانية الاحتياطية: بالاسم والسنة
+    const title = meta.title || meta.name;
+    const year = (meta.release_date || meta.first_air_date || '').slice(0, 4);
+    const searchQuery = type === 'movie' ? `${title} ${year}` : `${title} S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+    
+    const searchUrl = `https://torrentio.strem.fun/stream/${type === 'movie' ? 'movie' : 'series'}/${encodeURIComponent(searchQuery)}.json`;
+    const backupRes = await fetchURL(searchUrl);
 
-    return {
-      magnet: `magnet:?xt=urn:btih:${stream.infoHash}`,
-      quality: stream.name?.includes('4K') ? '4K' : '1080p'
-    };
+    if (backupRes.status === 200 && backupRes.data?.streams?.length > 0) {
+      const stream = backupRes.data.streams.find(s => s.infoHash);
+      if (stream) {
+        return {
+          magnet: `magnet:?xt=urn:btih:${stream.infoHash}`,
+          quality: stream.name?.includes('4K') ? '4K' : '1080p'
+        };
+      }
+    }
+
+    return null;
   } catch (err) {
     return null;
   }
@@ -94,15 +116,12 @@ async function fetchExternalMagnet(type, id, season, episode) {
 
 // ====== معالجة Real-Debrid ======
 async function processRealDebrid(magnet) {
-  // 1. إضافة المغناطيس
   const addRes = await fetchURL('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', { method: 'POST', body: { magnet } });
   if (!addRes.data?.id) return null;
   const torrentId = addRes.data.id;
 
-  // 2. اختيار الملفات
   await fetchURL(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`, { method: 'POST', body: { files: 'all' } });
 
-  // 3. انتظار التحميل/الجاهزية
   let torrentInfo = null;
   for (let i = 0; i < 15; i++) {
     const info = await fetchURL(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`);
@@ -115,7 +134,6 @@ async function processRealDebrid(magnet) {
 
   if (!torrentInfo || !torrentInfo.links?.length) return null;
 
-  // 4. استخراج رابط الميديا المباشر
   const unrestrict = await fetchURL('https://api.real-debrid.com/rest/1.0/unrestrict/link', { method: 'POST', body: { link: torrentInfo.links[0] } });
   return unrestrict.data?.download ? { url: unrestrict.data.download, filename: torrentInfo.filename } : null;
 }
@@ -130,11 +148,11 @@ app.get("/api/play", async (req, res) => {
     const meta = await getTMDBMeta(id, type);
     if (!meta) return res.status(404).json({ success: false, error: "TMDB Meta not found" });
 
-    // 1. جلب التورنت فوراً
-    const streamData = await fetchExternalMagnet(type, id, season, episode);
+    // جلب التورنت بالذكاء المزدوج
+    const streamData = await fetchExternalMagnet(type, id, season, episode, meta);
     if (!streamData) return res.status(404).json({ success: false, error: "No torrent found" });
 
-    // 2. معالجة عبر Real-Debrid
+    // معالجة عبر Real-Debrid
     const rdResult = await processRealDebrid(streamData.magnet);
     if (!rdResult) return res.status(500).json({ success: false, error: "Real-Debrid processing failed" });
 
