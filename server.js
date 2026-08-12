@@ -681,6 +681,35 @@ function firstAudioTrack(mediaInfo) {
   return first || null;
 }
 
+function allAudioTracks(mediaInfo) {
+  const audios = mediaInfo?.details?.audio;
+  if (!audios || typeof audios !== 'object') return [];
+  return Object.values(audios).filter(v => v && typeof v === 'object');
+}
+
+function getAudioCompatibility({ filename = '', mediaInfo = null } = {}) {
+  const name = String(filename).toLowerCase();
+  const tracks = allAudioTracks(mediaInfo);
+  const first = tracks[0] || null;
+  const codec = normalizeCodec(first?.codec);
+
+  const explicitGood = /(aac|mp4a|he-aac|lc-aac|\bmp3\b)/i.test(name);
+  const explicitBad = /(truehd|dts[- .]?hd|\bdts\b|eac3|e-ac-3|\bac3\b|\bddp\b|dolby[ .-]?digital|\batmos\b|flac)/i.test(name);
+
+  const goodCodec = /^(aac|mp3|opus|mp4a)/.test(codec);
+  const badCodec = /^(ac3|eac3|ec3|ddp|dolbydigital|truehd|dts|dtshd|flac)/.test(codec);
+
+  if (goodCodec || explicitGood) {
+    return { score: 1200, incompatible: false, codec: codec || null };
+  }
+
+  if (badCodec || explicitBad) {
+    return { score: -3000, incompatible: true, codec: codec || null };
+  }
+
+  return { score: 0, incompatible: false, codec: codec || null };
+}
+
 
 function normalizeCodec(codec) {
   return String(codec || '').toLowerCase().replace(/[.\s_-]/g, '');
@@ -706,6 +735,7 @@ function isBrowserNativeMedia(mediaInfo, unrestricted) {
   const container = getMediaContainer(filename, mimeType);
   const video = firstVideoTrack(mediaInfo);
   const codec = normalizeCodec(video?.codec);
+  const audio = getAudioCompatibility({ filename, mediaInfo });
 
   const h264 = codec === 'h264' || codec === 'avc' || codec.includes('avc1');
   const vp8 = codec === 'vp8';
@@ -714,7 +744,7 @@ function isBrowserNativeMedia(mediaInfo, unrestricted) {
   const mp4Native = container === 'mp4' && h264;
   const webmNative = container === 'webm' && (vp8 || vp9 || h264);
 
-  return mp4Native || webmNative;
+  return (mp4Native || webmNative) && !audio.incompatible;
 }
 
 
@@ -925,9 +955,12 @@ async function rdInspectLink(unrestrictedLink) {
     lowerName.endsWith(".webm") ||
     mimeType.toLowerCase().includes("video/webm");
 
+  const audioCompatibility = getAudioCompatibility({ filename, mediaInfo });
+
   const nativeBrowser =
     streamable &&
     !looksHevc &&
+    !audioCompatibility.incompatible &&
     (filenameLooksMp4 || filenameLooksWebm) &&
     (h264Like || !mediaInfo || !codec);
 
@@ -944,6 +977,7 @@ async function rdInspectLink(unrestrictedLink) {
     streamable,
     filenameLooksMp4,
     filenameLooksWebm,
+    audioCompatibility,
     nativeBrowser,
     link: unrestrictedLink,
   };
@@ -1002,7 +1036,8 @@ async function rdGetPlayableUrlFromInspection(info) {
   if (
     info.streamable &&
     info.filenameLooksMp4 &&
-    !info.looksHevc
+    !info.looksHevc &&
+    !info.audioCompatibility?.incompatible
   ) {
     console.log(
       `   ✅ Streamable MP4 fallback: ${info.filename}`
@@ -1061,6 +1096,7 @@ function browserFileScore(info) {
 
   if (info.nativeBrowser) score += 2500;
   if (info.streamable) score += 1000;
+  score += Number(info.audioCompatibility?.score || 0);
 
   const width = Number(info.video?.width || 0);
   const height = Number(info.video?.height || 0);
@@ -1247,6 +1283,44 @@ async function resolveCachedPlayback({ id, type, season, episode }) {
 // =============================================================
 
 
+function srtToWebVTT(srt) {
+  let text = String(srt || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+
+  if (!text) return 'WEBVTT\n\n';
+
+  text = text.replace(
+    /(\d{2}:\d{2}:\d{2}),(\d{3})/g,
+    '$1.$2'
+  );
+
+  const blocks = text.split(/\n{2,}/);
+  const out = ['WEBVTT', ''];
+
+  for (const block of blocks) {
+    const lines = block.split('\n');
+    const timeIndex = lines.findIndex((line) =>
+      /^\s*\d{2}:\d{2}:\d{2}\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}/.test(line)
+    );
+
+    if (timeIndex < 0) continue;
+
+    const timing = lines[timeIndex].trim();
+    const cueText = lines.slice(timeIndex + 1).join('\n').trim();
+    if (!cueText) continue;
+
+    out.push(timing);
+    out.push(cueText);
+    out.push('');
+  }
+
+  return out.join('\n');
+}
+
+
 async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year }) {
 
   if (!OS_API_KEY) return null;
@@ -1295,12 +1369,39 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
     });
 
 
-    if (searchRes.status !== 200 || !searchRes.data?.data?.length) return null;
+    let results = searchRes.status === 200 && Array.isArray(searchRes.data?.data)
+      ? searchRes.data.data
+      : [];
 
-    const candidates = searchRes.data.data.filter(s => s.attributes?.language === 'ar');
+    let candidates = results.filter(s => s.attributes?.language === 'ar' && s.attributes?.files?.length);
+
+    // Fallback: some titles have imperfect TMDB linkage in OpenSubtitles.
+    // Retry by title/year for movies or by title for TV if the exact TMDB lookup is empty.
+    if (!candidates.length && title) {
+      const fallbackQuery = encodeURIComponent(year ? `${title} ${year}` : title);
+      const fallbackUrl =
+        `${OS_BASE}/subtitles?query=${fallbackQuery}` +
+        `&languages=ar` +
+        `&order_by=download_count` +
+        `&order_direction=desc`;
+
+      const fallbackRes = await fetchURL(fallbackUrl, {
+        headers: {
+          'Api-Key': OS_API_KEY,
+          'User-Agent': 'BlueStream v1.0',
+          'Accept': 'application/json',
+        },
+        timeout: 12000,
+      });
+
+      results = fallbackRes.status === 200 && Array.isArray(fallbackRes.data?.data)
+        ? fallbackRes.data.data
+        : [];
+
+      candidates = results.filter(s => s.attributes?.language === 'ar' && s.attributes?.files?.length);
+    }
 
     if (!candidates.length) return null;
-
 
     const top = candidates[0];
 
@@ -1339,19 +1440,21 @@ async function searchOpenSubtitles({ tmdbId, type, season, episode, title, year 
     if (srtRes.status !== 200 || !srtRes.data) return null;
 
 
-    const srtContent = typeof srtRes.data === 'string' ? srtRes.data : String(srtRes.data);
+    const srtContent = typeof srtRes.data === 'string'
+      ? srtRes.data
+      : String(srtRes.data);
 
-    const srtBase64 = Buffer.from(srtContent, 'utf8').toString('base64');
-
-    const dataUrl = `data:text/plain;charset=utf-8;base64,${srtBase64}`;
-
+    const webvtt = srtToWebVTT(srtContent);
+    const subtitleBase64 = Buffer.from(webvtt, 'utf8').toString('base64');
+    const dataUrl = `data:text/vtt;charset=utf-8;base64,${subtitleBase64}`;
 
     return {
-
-      url: dataUrl, language: 'ar', label: 'العربية',
-
-      source: 'opensubtitles', release: top.attributes?.release || '',
-
+      url: dataUrl,
+      language: 'ar',
+      label: 'العربية',
+      source: 'opensubtitles',
+      format: 'vtt',
+      release: top.attributes?.release || '',
     };
 
   } catch (err) {
