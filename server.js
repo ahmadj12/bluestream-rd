@@ -810,34 +810,23 @@ async function rdUnrestrict(
    REAL-DEBRID MEDIA INFOS
 ============================================================ */
 
-async function rdGetMediaInfos(
-  streamingId
-) {
+async function rdGetMediaInfos(streamingId) {
   try {
-    const response =
-      await fetchURL(
-        `https://api.real-debrid.com/rest/1.0/streaming/mediaInfos/${encodeURIComponent(
-          streamingId
-        )}`,
-        {
-          method:
-            "GET",
+    const response = await fetchURL(
+      `https://api.real-debrid.com/rest/1.0/streaming/mediaInfos/${encodeURIComponent(streamingId)}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${RD_TOKEN}`
+        },
+        timeout: 15000
+      }
+    );
 
-          headers: {
-            Authorization:
-              `Bearer ${RD_TOKEN}`,
-          },
-
-          timeout:
-            15000,
-        }
-      );
-
-    if (
-      response.status !== 200
-    ) {
+    if (response.status !== 200) {
       console.warn(
-        `   ⚠ mediaInfos ${response.status} for ${streamingId}`
+        `   ⚠ mediaInfos ${response.status}:`,
+        response.data
       );
 
       return null;
@@ -847,6 +836,38 @@ async function rdGetMediaInfos(
   } catch (err) {
     console.warn(
       `   ⚠ mediaInfos error: ${err.message}`
+    );
+
+    return null;
+  }
+}
+
+async function rdGetTranscodedLinks(streamingId) {
+  try {
+    const response = await fetchURL(
+      `https://api.real-debrid.com/rest/1.0/streaming/transcode/${encodeURIComponent(streamingId)}`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${RD_TOKEN}`
+        },
+        timeout: 15000
+      }
+    );
+
+    if (response.status !== 200) {
+      console.warn(
+        `   ⚠ transcode ${response.status}:`,
+        response.data
+      );
+
+      return null;
+    }
+
+    return response.data;
+  } catch (err) {
+    console.warn(
+      `   ⚠ transcode error: ${err.message}`
     );
 
     return null;
@@ -1457,193 +1478,146 @@ function getNativeScore(
    PLAYABLE URL RESOLVER
 ============================================================ */
 
-async function rdGetPlayableUrl(
-  unrestrictedLink
-) {
-  if (!unrestrictedLink) {
+async function rdGetPlayableUrl(unrestrictedLink) {
+  if (!unrestrictedLink) return null;
+
+  const data = await rdUnrestrict(unrestrictedLink);
+
+  if (!data?.download) {
     return null;
   }
 
+  const filename = String(data.filename || "").toLowerCase();
+  const mimeType = String(data.mimeType || "").toLowerCase();
+
+  const isMp4 =
+    filename.endsWith(".mp4") ||
+    mimeType.includes("video/mp4");
+
+  const looksHevc =
+    filename.includes("hevc") ||
+    filename.includes("h.265") ||
+    filename.includes("h265") ||
+    filename.includes("x265") ||
+    filename.includes("av1");
+
   /*
-   * 1. Get fresh unrestricted URL.
+   * Real-Debrid itself says whether the returned file
+   * is streamable. Use this before mediaInfos.
+   *
+   * This fixes the case where mediaInfos returns 400
+   * but the file is already a browser-friendly MP4.
    */
-  const data =
-    await rdUnrestrict(
-      unrestrictedLink
+  if (
+    Number(data.streamable) === 1 &&
+    isMp4 &&
+    !looksHevc
+  ) {
+    console.log(
+      `   ✅ Native streamable MP4: ${data.filename}`
     );
 
-  if (!data?.id) {
-    console.warn(
-      "   ⚠ RD unrestrict did not return a streaming id"
-    );
-
-    return null;
+    return {
+      url: data.download,
+      type: "mp4",
+      filename: data.filename,
+      filesize: Number(data.filesize || 0),
+      mimeType: data.mimeType || "video/mp4",
+      native: true,
+      streamingId: data.id || null
+    };
   }
 
-  const streamingId =
-    data.id;
+  /*
+   * MediaInfo is useful, but it must NOT be mandatory.
+   */
+  let mediaInfo = null;
+
+  if (data.id) {
+    mediaInfo = await rdGetMediaInfos(data.id);
+
+    if (mediaInfo) {
+      const video = firstVideoTrack(mediaInfo);
+
+      console.log(
+        `   🎞 MediaInfo: ${
+          getMediaContainer(
+            data.filename,
+            data.mimeType
+          )
+        } | ${
+          video?.codec || "unknown"
+        } | ${
+          video?.width || "?"
+        }x${
+          video?.height || "?"
+        }`
+      );
+    } else {
+      console.log(
+        "   ⚠ mediaInfos unavailable; continuing with Transcode/native fallback"
+      );
+    }
+  }
 
   /*
-   * 2. Ask RD for actual media information.
+   * Try Real-Debrid transcoding.
    */
-  const mediaInfo =
-    await rdGetMediaInfos(
-      streamingId
+  if (data.id) {
+    const transcoded =
+      await rdGetTranscodedLinks(data.id);
+
+    const transcode =
+      pickBestTranscodeUrl(transcoded);
+
+    if (transcode?.url) {
+      console.log(
+        `   🎬 RD transcode: ${transcode.type}`
+      );
+
+      return {
+        url: transcode.url,
+        type: transcode.type,
+        formats: transcoded,
+        mediaInfo,
+        filename: data.filename,
+        filesize: Number(data.filesize || 0),
+        mimeType: data.mimeType || null,
+        streamingId: data.id
+      };
+    }
+  }
+
+  /*
+   * Final fallback:
+   * If RD marked it streamable and it's an MP4,
+   * allow it even when mediaInfos/transcode return 400.
+   */
+  if (
+    Number(data.streamable) === 1 &&
+    isMp4 &&
+    !looksHevc
+  ) {
+    console.log(
+      `   ✅ Native fallback after mediaInfos/transcode failure: ${data.filename}`
     );
 
-  const filename =
-    data.filename ||
-    mediaInfo?.filename ||
-    "unknown";
-
-  const video =
-    firstVideoTrack(
-      mediaInfo
-    );
-
-  const container =
-    getMediaContainer(
-      filename,
-      data.mimeType
-    );
+    return {
+      url: data.download,
+      type: "mp4",
+      filename: data.filename,
+      filesize: Number(data.filesize || 0),
+      mimeType: data.mimeType || "video/mp4",
+      native: true,
+      streamingId: data.id || null
+    };
+  }
 
   console.log(
-    `   🎞 MediaInfo: ${container} | ${
-      video?.codec || "unknown"
-    } | ${
-      video?.width || "?"
-    }x${
-      video?.height || "?"
-    }`
+    `   ❌ No playable stream: ${data.filename || "unknown file"}`
   );
 
-  /*
-   * 3. Ask RD for transcoding.
-   *
-   * HLS first.
-   */
-  const transcoded =
-    await rdGetTranscodedLinks(
-      streamingId
-    );
-
-  const transcodedPlayable =
-    pickBestTranscodeUrl(
-      transcoded
-    );
-
-  if (
-    transcodedPlayable?.url
-  ) {
-    console.log(
-      `   🎬 RD transcode: ${
-        transcodedPlayable.type
-      }`
-    );
-
-    return {
-      url:
-        transcodedPlayable.url,
-
-      type:
-        transcodedPlayable.type,
-
-      formats:
-        transcoded,
-
-      mediaInfo,
-
-      streamingId,
-
-      filename,
-
-      mimeType:
-        data.mimeType ||
-        null,
-
-      native:
-        false,
-    };
-  }
-
-  /*
-   * 4. If there is no transcode,
-   *    only allow browser-native formats.
-   */
-  if (
-    isBrowserNativeMedia(
-      mediaInfo,
-      data
-    )
-  ) {
-    console.log(
-      `   ▶ Native browser media: ${
-        container
-      }/${
-        video?.codec ||
-        "unknown"
-      }`
-    );
-
-    return {
-      url:
-        data.download,
-
-      type:
-        container ===
-        "webm"
-          ? "webm"
-          : "mp4",
-
-      formats:
-        null,
-
-      mediaInfo,
-
-      streamingId,
-
-      filename,
-
-      mimeType:
-        data.mimeType ||
-        null,
-
-      native:
-        true,
-    };
-  }
-
-  /*
-   * 5. Do not send MKV/HEVC raw.
-   */
-  console.warn(
-    `   ❌ No browser-compatible RD stream for ${filename} (${container}/${video?.codec || "unknown"})`
-  );
-
-  return {
-    url:
-      null,
-
-    type:
-      "unsupported",
-
-    formats:
-      transcoded ||
-      null,
-
-    mediaInfo,
-
-    streamingId,
-
-    filename,
-
-    mimeType:
-      data.mimeType ||
-      null,
-
-    native:
-      false,
-  };
+  return null;
 }
 
 /* ============================================================
