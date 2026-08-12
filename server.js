@@ -532,6 +532,100 @@ async function rdUnrestrict(link) {
 }
 
 
+// 🆕 Real-Debrid Transcoding — يحوّل MKV/HEVC لـ HLS/MP4 صديق للمتصفح
+
+// الـ response يحتوي streaming ID نقدر نحصل منه على m3u8 playlist
+
+async function rdGetTranscodedLinks(streamingId) {
+
+  try {
+
+    const response = await fetchURL(
+
+      `https://api.real-debrid.com/rest/1.0/streaming/transcode/${streamingId}`,
+
+      {
+
+        method: 'GET',
+
+        headers: { 'Authorization': `Bearer ${RD_TOKEN}` },
+
+        timeout: 10000,
+
+      }
+
+    );
+
+    return response.status === 200 ? response.data : null;
+
+  } catch { return null; }
+
+}
+
+
+// يحول رابط raw (MKV) إلى HLS playlist مدمج (friendly للمتصفح)
+
+async function rdGetPlayableUrl(unrestrictedLink) {
+
+  // أولاً: استدعي unrestrict/link
+
+  const data = await rdUnrestrict(unrestrictedLink);
+
+  if (!data?.id) {
+
+    // fallback: استخدم الـ download link مباشرة
+
+    return { url: unrestrictedLink, type: 'raw' };
+
+  }
+
+
+  // ثانياً: احصل على روابط transcoding
+
+  const transcoded = await rdGetTranscodedLinks(data.id);
+
+  if (transcoded) {
+
+    // أولوية: m3u8 (HLS) → mp4 → webm
+
+    if (transcoded.hls && Array.isArray(transcoded.hls) && transcoded.hls.length > 0) {
+
+      const fullHls = transcoded.hls.find(s => s.includes('/full.m3u8')) || transcoded.hls[0];
+
+      return { url: fullHls, type: 'hls', formats: transcoded };
+
+    }
+
+    if (transcoded.mp4 && Array.isArray(transcoded.mp4) && transcoded.mp4.length > 0) {
+
+      return { url: transcoded.mp4[0], type: 'mp4', formats: transcoded };
+
+    }
+
+    if (transcoded.webm && Array.isArray(transcoded.webm) && transcoded.webm.length > 0) {
+
+      return { url: transcoded.webm[0], type: 'webm', formats: transcoded };
+
+    }
+
+    // dash
+
+    if (transcoded.dash && Array.isArray(transcoded.dash) && transcoded.dash.length > 0) {
+
+      return { url: transcoded.dash[0], type: 'dash', formats: transcoded };
+
+    }
+
+  }
+
+
+  // fallback: استخدم raw link
+
+  return { url: data.download, type: 'raw', formats: null };
+
+}
+
+
 // =============================================================
 
 // OPENSUBTITLES
@@ -726,9 +820,15 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
     try {
 
-      let unrestricted = cached.data.rd_link ? await rdUnrestrict(cached.data.rd_link) : null;
+      let playable = null;
 
-      if (!unrestricted) {
+      if (cached.data.rd_link) {
+
+        playable = await rdGetPlayableUrl(cached.data.rd_link);
+
+      }
+
+      if (!playable?.url) {
 
         const added = await rdAddMagnet(cached.data.magnet);
 
@@ -738,13 +838,13 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
           const info = await rdWaitForTorrent(added.id, 180000);
 
-          if (info?.links?.length) unrestricted = await rdUnrestrict(info.links[0]);
+          if (info?.links?.length) playable = await rdGetPlayableUrl(info.links[0]);
 
         }
 
       }
 
-      if (unrestricted?.download) {
+      if (playable?.url) {
 
         await cache.setCache({
 
@@ -752,7 +852,7 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
           title: cached.data.title, year: cached.data.year,
 
-          stream_url: unrestricted.download,
+          stream_url: playable.url,
 
           rd_torrent_id: cached.data.rd_torrent_id, rd_link: cached.data.rd_link,
 
@@ -784,7 +884,9 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
           title: cached.data.title,
 
-          stream_url: unrestricted.download,
+          stream_url: playable.url,
+
+          stream_type: playable.type,
 
           subtitle, subtitles: subtitle ? [subtitle.url] : [],
 
@@ -922,17 +1024,17 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
     }
 
 
-    const unrestricted = await rdUnrestrict(bestLink);
+    const playable = await rdGetPlayableUrl(bestLink);
 
-    if (!unrestricted) {
+    if (!playable?.url) {
 
-      console.log(`   ❌ Unrestrict failed`);
+      console.log(`   ❌ Unrestrict/transcode failed`);
 
       continue;
 
     }
 
-    console.log(`   ✅ Got stream URL!`);
+    console.log(`   ✅ Got stream URL (${playable.type})!`);
 
 
     await cache.setCache({
@@ -953,7 +1055,9 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
       rd_torrent_id: added.id, rd_link: bestLink,
 
-      stream_url: unrestricted.download, filename: torrentInfo.filename,
+      stream_url: playable.url, stream_type: playable.type,
+
+      filename: torrentInfo.filename,
 
       file_size_bytes: bestSize || torrent.size || 0, quality: torrent.quality,
 
@@ -985,7 +1089,9 @@ async function tryGetStream({ id, type, sNum, eNum, withSubs }) {
 
       filename: torrentInfo.filename,
 
-      stream_url: unrestricted.download,
+      stream_url: playable.url,
+
+      stream_type: playable.type,
 
       subtitle, subtitles: subtitle ? [subtitle.url] : [],
 
