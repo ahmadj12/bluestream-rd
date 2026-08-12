@@ -1,7 +1,6 @@
 const express = require("express");
 const https = require("https");
 const http = require("http");
-const querystring = require("querystring");
 
 const app = express();
 app.use(express.json());
@@ -15,188 +14,385 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT;
 const RD_TOKEN = process.env.RD_TOKEN;
-const TMDB_KEY = "570589dd8a1dac1a24fc6f98c18d1e59";
 
 if (!RD_TOKEN) {
-  console.error("❌ RD_TOKEN is missing!");
+  console.error("❌ خطأ: لم يتم تعيين RD_TOKEN");
   process.exit(1);
 }
 
-// ====== دالة طلبات HTTP عامة ونظيفة ======
-function request(url, options = {}) {
+// ====== TMDB API ======
+const TMDB_KEY = "570589dd8a1dac1a24fc6f98c18d1e59";
+
+// ====== دالة طلب HTTP عامة ======
+function fetchURL(url, options = {}) {
   return new Promise((resolve, reject) => {
     const protocol = url.startsWith('https') ? https : http;
-    let bodyData = '';
-
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-      ...(options.headers || {}),
+    const reqOpts = {
+      method: options.method || 'GET',
+      headers: {
+        'Authorization': `Bearer ${RD_TOKEN}`,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        ...(options.headers || {}),
+      },
     };
 
-    if (options.body) {
-      if (typeof options.body === 'object') {
-        bodyData = querystring.stringify(options.body);
-        headers['Content-Type'] = 'application/x-www-form-urlencoded';
-      } else {
-        bodyData = options.body;
-      }
-      headers['Content-Length'] = Buffer.byteLength(bodyData);
-    }
-
-    const req = protocol.request(url, { method: options.method || 'GET', headers, timeout: 12000 }, (res) => {
+    const req = protocol.request(url, reqOpts, (res) => {
       let data = '';
-      res.on('data', chunk => data += chunk);
+      res.on('data', (chunk) => data += chunk);
       res.on('end', () => {
-        try { resolve({ status: res.statusCode, data: JSON.parse(data) }); }
-        catch (e) { resolve({ status: res.statusCode, data }); }
+        try {
+          resolve({ status: res.statusCode, data: JSON.parse(data) });
+        } catch (e) {
+          resolve({ status: res.statusCode, data });
+        }
       });
     });
 
     req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('Timeout')));
-    if (bodyData) req.write(bodyData);
+    if (options.body) req.write(options.body);
     req.end();
   });
 }
 
-// 1. جلب بيانات TMDB و IMDb ID
+// ====== TMDB ======
 async function getTMDBMeta(id, type) {
-  const path = type === 'movie' ? 'movie' : 'tv';
-  const url = `https://api.themoviedb.org/3/${path}/${id}?api_key=${TMDB_KEY}&append_to_response=external_ids&language=en-US`;
-  const res = await request(url);
-  if (res.status !== 200) return { error: `TMDB returned status ${res.status}` };
-  return { meta: res.data };
+  try {
+    const path = type === 'movie' ? 'movie' : 'tv';
+    const url = `https://api.themoviedb.org/3/${path}/${id}?api_key=${TMDB_KEY}&language=en-US`;
+    const response = await fetchURL(url);
+    return response.status === 200 ? response.data : null;
+  } catch (err) {
+    return null;
+  }
 }
 
-// 2. جلب Magnet من Torrentio مع تخطي الحماية ومحرك احتياطي
-async function fetchTorrentio(type, imdbId, season, episode) {
-  const queryPath = type === 'movie' ? `movie/${imdbId}` : `series/${imdbId}:${season}:${episode}`;
+// ====== TorrentDownloads.pro - Scraper ======
+async function searchTorrentDownloads(query) {
+  try {
+    const targetUrl = `https://www.torrentdownloads.pro/search/?search=${encodeURIComponent(query)}&s_cat=4`; // 4 = movies
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+    
+    console.log(`   → TorrentDownloads`);
+    const response = await fetchURL(proxyUrl);
+    if (response.status !== 200 || !response.data?.contents) return [];
+    
+    const html = response.data.contents;
+    const results = [];
+    
+    // البحث عن روابط الـ torrents من جدول النتائج
+    const torrentRegex = /<a\s+href="(\/torrent\/\d+\/[^"]+)"[^>]*>([^<]+)<\/a>/g;
+    let match;
+    while ((match = torrentRegex.exec(html)) !== null) {
+      const torrentName = match[2].trim();
+      
+      // فلترة: نتجاهل الملفات الصوتية، الألعاب، البرامج
+      const lower = torrentName.toLowerCase();
+      if (lower.includes('.mp3') || lower.includes('soundtrack')) continue;
+      if (lower.includes('kms') || lower.includes('activator')) continue;
+      if (lower.includes('crack') || lower.includes('patch')) continue;
+      if (lower.includes('game ') || lower.includes('android')) continue;
+      
+      results.push({
+        name: torrentName,
+        url_path: match[1],
+        quality: lower.includes('1080p') ? '1080p' : 
+                lower.includes('720p') ? '720p' : 
+                lower.includes('2160p') || lower.includes('4k') ? '4K' : '480p',
+        size: 0,
+        source: 'torrentdownloads',
+        magnet: null,
+      });
+    }
+    
+    console.log(`      ✓ Found ${results.length} relevant torrents`);
+    return results.slice(0, 10);
+  } catch (err) {
+    console.warn('TorrentDownloads search error:', err.message);
+    return [];
+  }
+}
+
+// ====== جلب magnet من صفحة تفاصيل torrent ======
+async function getMagnetFromTorrentPage(urlPath) {
+  try {
+    const targetUrl = `https://www.torrentdownloads.pro${urlPath}`;
+    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`;
+    
+    const response = await fetchURL(proxyUrl);
+    if (response.status !== 200 || !response.data?.contents) return null;
+    
+    const html = response.data.contents;
+    
+    // البحث عن magnet link في الـ HTML
+    const magnetMatch = html.match(/(magnet:\?xt=urn:btih:[a-fA-F0-9]{40}[^"<\s']*)/);
+    return magnetMatch ? magnetMatch[1] : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// ====== البحث الموحد + جلب magnets بالتوازي ======
+async function searchAllSources(query, type) {
+  console.log(`🔍 Searching: "${query}"`);
   
-  // إضافة هيدرات متصفح حقيقي لتخطي حظر Cloudflare
-  const options = {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      'Accept': 'application/json, text/plain, */*',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Connection': 'keep-alive'
-    }
-  };
-
-  // المحاولة الأولى: Torrentio الأساسي
-  let res = await request(`https://torrentio.strem.fun/stream/${queryPath}.json`, options);
-
-  // المحاولة الثانية: إذا تم حظر السيرفر (403) أو فشل، ننتقل فوراً لمحرك KnightCrawler المفتوح
-  if (res.status === 403 || res.status !== 200) {
-    res = await request(`https://knightcrawler.elfhosted.com/stream/${queryPath}.json`, options);
+  // 1) torrentdownloads.pro
+  const tdResults = await searchTorrentDownloads(query);
+  
+  if (tdResults.length === 0) {
+    console.log(`❌ No torrents found`);
+    return [];
   }
-
-  // إذا فشل الاثنان معاً
-  if (res.status !== 200) return { error: `All scrapers blocked or failed. Last status: ${res.status}` };
-  if (!res.data?.streams?.length) return { error: "No torrent streams found for this title" };
-
-  // استخراج رابط المغناطيس
-  const stream = res.data.streams.find(s => s.infoHash);
-  if (!stream) return { error: "Valid infoHash not found in stream" };
-
-  return {
-    magnet: `magnet:?xt=urn:btih:${stream.infoHash}`,
-    quality: stream.name?.includes('4K') ? '4K' : (stream.name?.includes('1080p') ? '1080p' : 'Unknown')
-  };
+  
+  // 2) جلب magnets لكل torrent (بالتوازي)
+  console.log(`📥 Fetching magnets for ${tdResults.length} torrents...`);
+  
+  const magnetPromises = tdResults.map(async (torrent) => {
+    const magnet = await getMagnetFromTorrentPage(torrent.url_path);
+    if (magnet) {
+      torrent.magnet = magnet;
+      torrent.filename = torrent.name;
+      return true;
+    }
+    return false;
+  });
+  
+  await Promise.all(magnetPromises);
+  
+  // فلترة: بس اللي عندهم magnet
+  const withMagnets = tdResults.filter(t => t.magnet);
+  console.log(`📊 Got ${withMagnets.length} magnets`);
+  
+  return withMagnets;
 }
 
-// 3. معالجة التحويل مع Real-Debrid
-async function processRealDebrid(magnet) {
-  const rdHeaders = { 'Authorization': `Bearer ${RD_TOKEN}` };
-
-  // إضافة المغناطيس
-  const addRes = await request('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
-    method: 'POST',
-    headers: rdHeaders,
-    body: { magnet }
-  });
-
-  if (!addRes.data?.id) return { error: `RD AddMagnet Failed (${addRes.status}): ${JSON.stringify(addRes.data)}` };
-  const torrentId = addRes.data.id;
-
-  // اختيار كافة الملفات
-  await request(`https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`, {
-    method: 'POST',
-    headers: rdHeaders,
-    body: { files: 'all' }
-  });
-
-  // الانتظار حتى اكتمال المعالجة
-  let torrentInfo = null;
-  for (let i = 0; i < 15; i++) {
-    const info = await request(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`, { headers: rdHeaders });
-    if (info.data?.status === 'downloaded') {
-      torrentInfo = info.data;
-      break;
-    }
-    await new Promise(r => setTimeout(r, 1500));
-  }
-
-  if (!torrentInfo || !torrentInfo.links?.length) {
-    return { error: `RD Download Timeout or No Links generated` };
-  }
-
-  // فك التشفير للحصول على رابط مباشر
-  const unrestrict = await request('https://api.real-debrid.com/rest/1.0/unrestrict/link', {
-    method: 'POST',
-    headers: rdHeaders,
-    body: { link: torrentInfo.links[0] }
-  });
-
-  if (!unrestrict.data?.download) {
-    return { error: `RD Unrestrict Link Failed: ${JSON.stringify(unrestrict.data)}` };
-  }
-
-  return { url: unrestrict.data.download, filename: torrentInfo.filename };
+// ====== تقييم الجودة ======
+function getQualityScore(title) {
+  if (!title) return 50;
+  const f = title.toLowerCase();
+  if (f.includes('2160p') || f.includes('4k') || f.includes('uhd')) return 400;
+  if (f.includes('1080p') || f.includes('fhd') || f.includes('bluray')) return 300;
+  if (f.includes('720p')) return 200;
+  if (f.includes('480p')) return 100;
+  return 50;
 }
 
-// ====== API Main Endpoint ======
+// ====== RD: إضافة Magnet ======
+async function rdAddMagnet(magnet) {
+  try {
+    const response = await fetchURL('https://api.real-debrid.com/rest/1.0/torrents/addMagnet', {
+      method: 'POST',
+      body: `magnet=${encodeURIComponent(magnet)}`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    if (response.status === 200 || response.status === 201) {
+      return response.data;
+    }
+    console.error(`❌ RD addMagnet: ${response.status}`, response.data);
+    return null;
+  } catch (err) {
+    console.error('RD addMagnet error:', err.message);
+    return null;
+  }
+}
+
+// ====== RD: اختيار الملفات ======
+async function rdSelectFiles(torrentId, files = 'all') {
+  try {
+    const response = await fetchURL(
+      `https://api.real-debrid.com/rest/1.0/torrents/selectFiles/${torrentId}`,
+      {
+        method: 'POST',
+        body: `files=${files}`,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      }
+    );
+    return response.status === 200 || response.status === 204;
+  } catch (err) {
+    return false;
+  }
+}
+
+// ====== RD: معلومات Torrent ======
+async function rdGetTorrentInfo(torrentId) {
+  try {
+    const response = await fetchURL(`https://api.real-debrid.com/rest/1.0/torrents/info/${torrentId}`);
+    return response.status === 200 ? response.data : null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// ====== RD: انتظار حتى يكتمل التحميل ======
+async function rdWaitForTorrent(torrentId, maxWaitMs = 300000) {
+  const startTime = Date.now();
+  const interval = 3000;
+
+  while (Date.now() - startTime < maxWaitMs) {
+    const info = await rdGetTorrentInfo(torrentId);
+    if (info) {
+      const status = info.status;
+      console.log(`📊 RD: ${status} | ${(info.progress || 0).toFixed(0)}%`);
+      
+      if (status === 'downloaded') return info;
+      if (status === 'waiting_files_selection') {
+        await rdSelectFiles(torrentId, 'all');
+        return info;
+      }
+      if (status === 'error' || status === 'magnet_error') {
+        console.error(`❌ Torrent error: ${status}`);
+        return null;
+      }
+    }
+    await new Promise(resolve => setTimeout(resolve, interval));
+  }
+  return null;
+}
+
+// ====== RD: Unrestrict Link ======
+async function rdUnrestrict(link) {
+  try {
+    const response = await fetchURL('https://api.real-debrid.com/rest/1.0/unrestrict/link', {
+      method: 'POST',
+      body: `link=${encodeURIComponent(link)}`,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+    if (response.status === 200 || response.status === 201) {
+      return response.data;
+    }
+    console.error(`❌ RD Unrestrict: ${response.status}`, response.data);
+    return null;
+  } catch (err) {
+    return null;
+  }
+}
+
+// ====== API الرئيسي ======
 app.get("/api/play", async (req, res) => {
-  const { id, type, season = 1, episode = 1 } = req.query;
+  const { id, type, season, episode } = req.query;
 
-  if (!id || !type) return res.status(400).json({ success: false, error: "Missing parameters" });
+  if (!id || !type) {
+    return res.status(400).json({ success: false, error: "Missing id or type" });
+  }
 
   try {
-    // الخطوة الأولى: TMDB
-    const tmdbRes = await getTMDBMeta(id, type);
-    if (tmdbRes.error) return res.status(404).json({ success: false, step: "TMDB", error: tmdbRes.error });
-    const meta = tmdbRes.meta;
+    // 1) TMDB metadata
+    const meta = await getTMDBMeta(id, type);
+    if (!meta) return res.status(404).json({ success: false, error: "TMDB not found" });
 
-    const imdbId = meta.external_ids?.imdb_id || meta.imdb_id;
-    if (!imdbId) return res.status(404).json({ success: false, step: "IMDb_Check", error: "IMDb ID not found for this item" });
+    const displayTitle = meta.title || meta.name || meta.original_title || meta.original_name;
+    const year = (meta.release_date || meta.first_air_date || '').slice(0, 4);
+    const poster = meta.poster_path ? `https://image.tmdb.org/t/p/w500${meta.poster_path}` : null;
 
-    // الخطوة الثانية: Torrentio
-    const torrentRes = await fetchTorrentio(type, imdbId, parseInt(season), parseInt(episode));
-    if (torrentRes.error) return res.status(404).json({ success: false, step: "Torrentio", imdb_id: imdbId, error: torrentRes.error });
+    console.log(`\n🎬 ${displayTitle} (${year}) | ${type} S${season || 1}E${episode || 1}`);
 
-    // الخطوة الثالثة: Real-Debrid
-    const rdRes = await processRealDebrid(torrentRes.magnet);
-    if (rdRes.error) return res.status(500).json({ success: false, step: "Real-Debrid", error: rdRes.error });
+    // 2) بناء استعلام البحث
+    let searchQuery;
+    if (type === 'movie') {
+      searchQuery = year ? `${displayTitle} ${year}` : displayTitle;
+    } else {
+      searchQuery = `${displayTitle} S${String(season || 1).padStart(2, '0')}E${String(episode || 1).padStart(2, '0')}`;
+    }
 
-    return res.json({
-      success: true,
-      title: meta.title || meta.name,
-      imdb_id: imdbId,
-      quality: torrentRes.quality,
-      stream_url: rdRes.url,
-      filename: rdRes.filename
+    // 3) البحث في TorrentDownloads.pro
+    const torrents = await searchAllSources(searchQuery, type);
+
+    if (torrents.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: `لم يتم العثور على "${displayTitle}"`,
+        title: displayTitle,
+        year,
+      });
+    }
+
+    // ترتيب حسب الجودة (الأعلى أولاً)
+    torrents.sort((a, b) => getQualityScore(b.name) - getQualityScore(a.name));
+
+    console.log(`📋 Trying ${torrents.length} torrents...`);
+
+    // 4) جرب كل torrent مع RD
+    for (let i = 0; i < Math.min(3, torrents.length); i++) {
+      const torrent = torrents[i];
+      console.log(`\n🔄 [${i + 1}] ${torrent.name.substring(0, 60)}`);
+      console.log(`   Magnet: ${torrent.magnet.substring(0, 60)}...`);
+
+      // إضافة لـ Real-Debrid
+      const added = await rdAddMagnet(torrent.magnet);
+      if (!added || !added.id) {
+        console.log(`   ❌ Failed to add to RD`);
+        continue;
+      }
+
+      console.log(`   ✓ Added to RD: ${added.id}`);
+
+      // اختيار كل الملفات تلقائياً
+      await rdSelectFiles(added.id, 'all');
+
+      // انتظار التحميل
+      const torrentInfo = await rdWaitForTorrent(added.id);
+      if (!torrentInfo) {
+        console.log(`   ❌ Download timeout`);
+        continue;
+      }
+
+      console.log(`   ✓ Downloaded: ${torrentInfo.filename}`);
+
+      // إيجاد رابط الملف
+      const links = torrentInfo.links || [];
+      if (links.length === 0) {
+        console.log(`   ❌ No links found`);
+        continue;
+      }
+
+      // Unrestrict أول ملف فيديو
+      const unrestricted = await rdUnrestrict(links[0]);
+      if (!unrestricted) {
+        console.log(`   ❌ Unrestrict failed`);
+        continue;
+      }
+
+      console.log(`   ✅ Got stream URL!`);
+
+      return res.json({
+        success: true,
+        provider: `real-debrid+torrentdownloads`,
+        quality: torrent.quality,
+        title: displayTitle,
+        year,
+        filename: torrentInfo.filename,
+        stream_url: unrestricted.download,
+        subtitles: [],
+        size_mb: Math.round((torrentInfo.filesize || 0) / 1024 / 1024),
+        poster,
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: `فشل تحميل أي من ${torrents.length} torrents`,
+      title: displayTitle,
     });
 
   } catch (err) {
+    console.error("❌ Error:", err);
     return res.status(500).json({ success: false, error: err.message });
   }
 });
 
+// ====== Health Check ======
 app.get("/", (req, res) => {
-  res.json({ status: "✅ Server Ready and Working Perfectly" });
+  res.json({
+    status: "✅ Real-Debrid + TorrentDownloads API",
+    version: "4.2",
+    endpoints: {
+      play: "/api/play?id={tmdb_id}&type={movie|tv}&season=1&episode=1",
+    },
+  });
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`\n🎬 RD + TorrentDownloads API v4.2 running on port ${PORT}`);
+  console.log(`✅ RD Token: ${RD_TOKEN ? 'Loaded' : 'MISSING'}`);
 });
